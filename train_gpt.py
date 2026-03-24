@@ -51,7 +51,9 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
     ttt_prefix_tokens = int(os.environ.get("TTT_PREFIX_TOKENS", 128))
+    ttt_steps = int(os.environ.get("TTT_STEPS", 1))
     ttt_lr = float(os.environ.get("TTT_LR", 0.01))
+    ttt_max_prefix_fraction = float(os.environ.get("TTT_MAX_PREFIX_FRACTION", 0.5))
     ttt_param_patterns = tuple(
         pattern for pattern in os.environ.get("TTT_PARAM_PATTERNS", "attn_scale,mlp_scale,resid_mix").split(",") if pattern
     )
@@ -290,6 +292,10 @@ def _reset_ttt_params(params: list[Tensor], initial_values: list[Tensor]) -> Non
             param.copy_(initial)
 
 
+def _reset_ttt_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
+    optimizer.state.clear()
+
+
 def eval_val_ttt(
     args: Hyperparameters,
     model: nn.Module,
@@ -305,6 +311,7 @@ def eval_val_ttt(
 ) -> tuple[float, float]:
     if not ttt_params:
         raise ValueError("TTT is enabled but no adaptable parameters matched TTT_PARAM_PATTERNS")
+    t_start = time.perf_counter()
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -317,6 +324,12 @@ def eval_val_ttt(
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     prefix_len = min(max(args.ttt_prefix_tokens, 0), args.train_seq_len)
+    max_adapt_prefix_len = int(args.ttt_max_prefix_fraction * args.train_seq_len)
+    allow_ttt = (
+        args.ttt_steps > 0
+        and 0 < prefix_len < args.train_seq_len
+        and prefix_len <= max_adapt_prefix_len
+    )
     initial_values = [param.detach().clone() for param in ttt_params]
     all_params = list(model.parameters())
     requires_grad_flags = [param.requires_grad for param in all_params]
@@ -324,6 +337,9 @@ def eval_val_ttt(
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    adapted_seq_count = 0
+    skipped_seq_count = 0
+    total_update_steps = 0
 
     try:
         model.eval()
@@ -344,9 +360,10 @@ def eval_val_ttt(
                 x = x_batch[seq_idx : seq_idx + 1]
                 y = y_batch[seq_idx : seq_idx + 1]
                 _reset_ttt_params(ttt_params, initial_values)
+                _reset_ttt_optimizer_state(optimizer)
                 optimizer.zero_grad(set_to_none=True)
 
-                if prefix_len > 0:
+                if allow_ttt:
                     x_prefix = x[:, :prefix_len]
                     y_prefix = y[:, :prefix_len]
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
@@ -360,11 +377,16 @@ def eval_val_ttt(
                         has_leading_space_lut[tgt_prefix] & ~is_boundary_token_lut[prev_prefix]
                     ).to(dtype=torch.int16)
                     val_byte_count += prefix_bytes.to(torch.float64).sum()
-                    prefix_loss.backward()
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    for step_idx in range(args.ttt_steps):
+                        if step_idx > 0:
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                                prefix_loss = model(x_prefix, y_prefix)
+                        prefix_loss.backward()
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    adapted_seq_count += 1
+                    total_update_steps += args.ttt_steps
 
-                if prefix_len < args.train_seq_len:
                     scored_targets = y.clone()
                     scored_targets[:, :prefix_len] = -100
                     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
@@ -379,11 +401,34 @@ def eval_val_ttt(
                         has_leading_space_lut[tgt_suffix] & ~is_boundary_token_lut[prev_suffix]
                     ).to(dtype=torch.int16)
                     val_byte_count += suffix_bytes.to(torch.float64).sum()
+                else:
+                    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        full_loss = model(x, y)
+                    full_tokens = args.train_seq_len
+                    val_loss_sum += full_loss.to(torch.float64) * float(full_tokens)
+                    val_token_count += float(full_tokens)
+                    prev_full = x.reshape(-1)
+                    tgt_full = y.reshape(-1)
+                    full_bytes = base_bytes_lut[tgt_full].to(dtype=torch.int16)
+                    full_bytes += (
+                        has_leading_space_lut[tgt_full] & ~is_boundary_token_lut[prev_full]
+                    ).to(dtype=torch.int16)
+                    val_byte_count += full_bytes.to(torch.float64).sum()
+                    skipped_seq_count += 1
 
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
             dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+            ttt_stats = torch.tensor(
+                [adapted_seq_count, skipped_seq_count, total_update_steps],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(ttt_stats, op=dist.ReduceOp.SUM)
+            adapted_seq_count = int(ttt_stats[0].item())
+            skipped_seq_count = int(ttt_stats[1].item())
+            total_update_steps = int(ttt_stats[2].item())
     finally:
         _reset_ttt_params(ttt_params, initial_values)
         optimizer.zero_grad(set_to_none=True)
@@ -394,6 +439,14 @@ def eval_val_ttt(
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    if rank == 0:
+        elapsed_ms = 1000.0 * (time.perf_counter() - t_start)
+        print(
+            f"ttt_eval adapted_seqs:{adapted_seq_count} skipped_seqs:{skipped_seq_count} "
+            f"update_steps:{total_update_steps} prefix_tokens:{prefix_len} "
+            f"allow_ttt:{int(allow_ttt)} elapsed_ms:{elapsed_ms:.0f}",
+            flush=True,
+        )
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 # -----------------------------
@@ -1021,7 +1074,8 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(
         f"ttt:enabled={args.ttt_enable} prefix_tokens:{args.ttt_prefix_tokens} "
-        f"lr:{args.ttt_lr} matched_params:{sum(int(p.numel()) for p in ttt_params)} "
+        f"steps:{args.ttt_steps} lr:{args.ttt_lr} max_prefix_fraction:{args.ttt_max_prefix_fraction:.2f} "
+        f"matched_params:{sum(int(p.numel()) for p in ttt_params)} "
         f"patterns:{','.join(args.ttt_param_patterns)}"
     )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1107,6 +1161,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            t_eval = time.perf_counter()
             if args.ttt_enable:
                 val_loss, val_bpb = eval_val_ttt(
                     args,
@@ -1134,9 +1189,11 @@ def main() -> None:
                     has_leading_space_lut,
                     is_boundary_token_lut,
                 )
+            eval_time_ms = 1000.0 * (time.perf_counter() - t_eval)
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
+                f"eval_mode:{'ttt' if args.ttt_enable else 'standard'} eval_time:{eval_time_ms:.0f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
