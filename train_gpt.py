@@ -49,6 +49,12 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+    ttt_prefix_tokens = int(os.environ.get("TTT_PREFIX_TOKENS", 128))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.01))
+    ttt_param_patterns = tuple(
+        pattern for pattern in os.environ.get("TTT_PARAM_PATTERNS", "attn_scale,mlp_scale,resid_mix").split(",") if pattern
+    )
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -275,6 +281,119 @@ def eval_val(
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def _reset_ttt_params(params: list[Tensor], initial_values: list[Tensor]) -> None:
+    with torch.no_grad():
+        for param, initial in zip(params, initial_values, strict=True):
+            param.copy_(initial)
+
+
+def eval_val_ttt(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    ttt_params: list[Tensor],
+) -> tuple[float, float]:
+    if not ttt_params:
+        raise ValueError("TTT is enabled but no adaptable parameters matched TTT_PARAM_PATTERNS")
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    if local_batch_tokens < args.train_seq_len:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    local_batch_seqs = local_batch_tokens // args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+    prefix_len = min(max(args.ttt_prefix_tokens, 0), args.train_seq_len)
+    initial_values = [param.detach().clone() for param in ttt_params]
+    all_params = list(model.parameters())
+    requires_grad_flags = [param.requires_grad for param in all_params]
+    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr)
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    try:
+        model.eval()
+        for param in all_params:
+            param.requires_grad_(False)
+        for param in ttt_params:
+            param.requires_grad_(True)
+
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+            raw_start = batch_seq_start * args.train_seq_len
+            raw_end = batch_seq_end * args.train_seq_len + 1
+            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            x_batch = local[:-1].reshape(-1, args.train_seq_len)
+            y_batch = local[1:].reshape(-1, args.train_seq_len)
+
+            for seq_idx in range(x_batch.size(0)):
+                x = x_batch[seq_idx : seq_idx + 1]
+                y = y_batch[seq_idx : seq_idx + 1]
+                _reset_ttt_params(ttt_params, initial_values)
+                optimizer.zero_grad(set_to_none=True)
+
+                if prefix_len > 0:
+                    x_prefix = x[:, :prefix_len]
+                    y_prefix = y[:, :prefix_len]
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        prefix_loss = model(x_prefix, y_prefix)
+                    val_loss_sum += prefix_loss.detach().to(torch.float64) * float(prefix_len)
+                    val_token_count += float(prefix_len)
+                    prev_prefix = x_prefix.reshape(-1)
+                    tgt_prefix = y_prefix.reshape(-1)
+                    prefix_bytes = base_bytes_lut[tgt_prefix].to(dtype=torch.int16)
+                    prefix_bytes += (
+                        has_leading_space_lut[tgt_prefix] & ~is_boundary_token_lut[prev_prefix]
+                    ).to(dtype=torch.int16)
+                    val_byte_count += prefix_bytes.to(torch.float64).sum()
+                    prefix_loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                if prefix_len < args.train_seq_len:
+                    scored_targets = y.clone()
+                    scored_targets[:, :prefix_len] = -100
+                    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        suffix_loss = model(x, scored_targets)
+                    suffix_tokens = args.train_seq_len - prefix_len
+                    val_loss_sum += suffix_loss.to(torch.float64) * float(suffix_tokens)
+                    val_token_count += float(suffix_tokens)
+                    prev_suffix = x[:, prefix_len:].reshape(-1)
+                    tgt_suffix = y[:, prefix_len:].reshape(-1)
+                    suffix_bytes = base_bytes_lut[tgt_suffix].to(dtype=torch.int16)
+                    suffix_bytes += (
+                        has_leading_space_lut[tgt_suffix] & ~is_boundary_token_lut[prev_suffix]
+                    ).to(dtype=torch.int16)
+                    val_byte_count += suffix_bytes.to(torch.float64).sum()
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+    finally:
+        _reset_ttt_params(ttt_params, initial_values)
+        optimizer.zero_grad(set_to_none=True)
+        for param, requires_grad in zip(all_params, requires_grad_flags, strict=True):
+            param.requires_grad_(requires_grad)
+        model.train()
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 # -----------------------------
@@ -861,6 +980,12 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    ttt_named_params = [
+        (name, param)
+        for name, param in base_model.named_parameters()
+        if any(pattern in name for pattern in args.ttt_param_patterns)
+    ]
+    ttt_params = [param for _, param in ttt_named_params]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -894,6 +1019,11 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(
+        f"ttt:enabled={args.ttt_enable} prefix_tokens:{args.ttt_prefix_tokens} "
+        f"lr:{args.ttt_lr} matched_params:{sum(int(p.numel()) for p in ttt_params)} "
+        f"patterns:{','.join(args.ttt_param_patterns)}"
+    )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -977,18 +1107,33 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
+            if args.ttt_enable:
+                val_loss, val_bpb = eval_val_ttt(
+                    args,
+                    base_model,
+                    rank,
+                    world_size,
+                    device,
+                    grad_accum_steps,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                    ttt_params,
+                )
+            else:
+                val_loss, val_bpb = eval_val(
+                    args,
+                    model,
+                    rank,
+                    world_size,
+                    device,
+                    grad_accum_steps,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1099,18 +1244,33 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
+    if args.ttt_enable:
+        q_val_loss, q_val_bpb = eval_val_ttt(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            ttt_params,
+        )
+    else:
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
     torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
