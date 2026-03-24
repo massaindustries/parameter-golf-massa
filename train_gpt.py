@@ -49,6 +49,8 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
+    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
     ttt_prefix_tokens = int(os.environ.get("TTT_PREFIX_TOKENS", 128))
@@ -94,6 +96,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -288,6 +292,82 @@ def eval_val(
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+    batch_seqs: int,
+) -> tuple[float, float]:
+    """Score each token once while giving it near-maximum context."""
+    seq_len = args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
+    window_starts = [start for start in range(0, total_tokens, stride) if min(start + seq_len, total_tokens) - start >= 1]
+    total_windows = len(window_starts)
+    my_start = (total_windows * rank) // world_size
+    my_end = (total_windows * (rank + 1)) // world_size
+    my_windows = window_starts[my_start:my_end]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    base_model.eval()
+    with torch.inference_mode():
+        for batch_idx in range(0, len(my_windows), batch_seqs):
+            batch_windows = my_windows[batch_idx : batch_idx + batch_seqs]
+            batch_size = len(batch_windows)
+            x_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
+            window_lengths: list[int] = []
+
+            for row_idx, window_start in enumerate(batch_windows):
+                window_end = min(window_start + seq_len, total_tokens)
+                window_len = window_end - window_start
+                window_lengths.append(window_len)
+                chunk = val_tokens[window_start : window_end + 1].to(dtype=torch.int64, device=device, non_blocking=True)
+                x_batch[row_idx, :window_len] = chunk[:-1]
+                y_batch[row_idx, :window_len] = chunk[1:]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = base_model.forward_logits(x_batch)
+
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).reshape(batch_size, seq_len)
+
+            for row_idx, window_start in enumerate(batch_windows):
+                window_len = window_lengths[row_idx]
+                score_start = 0 if window_start == 0 else max(window_len - stride, 0)
+                scored_nll = nll[row_idx, score_start:window_len].to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(window_len - score_start)
+                tgt_ids = y_batch[row_idx, score_start:window_len]
+                prev_ids = x_batch[row_idx, score_start:window_len]
+                token_bytes = base_bytes_lut[tgt_ids].to(torch.float64)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
+                byte_count += token_bytes.sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = loss_sum / token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    base_model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
@@ -666,6 +746,71 @@ def eval_val_ttt(
         is_boundary_token_lut,
         ttt_params,
     )
+
+
+def run_validation(
+    args: Hyperparameters,
+    model: nn.Module,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    val_tokens_ttt: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    ttt_params: list[Tensor],
+    bos_token_id: int,
+) -> tuple[float, float, str]:
+    if args.ttt_enable:
+        val_loss, val_bpb = eval_val_ttt(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens_ttt,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            ttt_params,
+            bos_token_id,
+        )
+        return val_loss, val_bpb, f"ttt:{args.ttt_scope}"
+
+    if 0 < args.eval_stride < args.train_seq_len:
+        val_loss, val_bpb = eval_val_sliding(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            stride=args.eval_stride,
+            batch_seqs=args.eval_batch_seqs,
+        )
+        return val_loss, val_bpb, f"sliding:s{args.eval_stride}"
+
+    val_loss, val_bpb = eval_val(
+        args,
+        model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    )
+    return val_loss, val_bpb, "standard"
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1087,7 +1232,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1102,15 +1247,18 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.forward_logits(input_ids).reshape(-1, self.tok_emb.num_embeddings)
+        targets = target_ids.reshape(-1)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -1305,6 +1453,10 @@ def main() -> None:
         f"matched_params:{sum(int(p.numel()) for p in ttt_params)} "
         f"patterns:{','.join(args.ttt_param_patterns)}"
     )
+    log0(f"eval:stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
+    log0(f"ema:enabled={args.ema_enabled} decay:{args.ema_decay}")
+    if args.ttt_enable and args.eval_stride > 0:
+        log0(f"eval_stride_ignored_due_to_ttt:{args.eval_stride}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1375,6 +1527,11 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
+    ema_state = (
+        {name: tensor.detach().float().clone() for name, tensor in base_model.state_dict().items()}
+        if args.ema_enabled
+        else None
+    )
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1389,39 +1546,27 @@ def main() -> None:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             t_eval = time.perf_counter()
-            if args.ttt_enable:
-                val_loss, val_bpb = eval_val_ttt(
-                    args,
-                    base_model,
-                    rank,
-                    world_size,
-                    device,
-                    grad_accum_steps,
-                    val_tokens_ttt,
-                    base_bytes_lut,
-                    has_leading_space_lut,
-                    is_boundary_token_lut,
-                    ttt_params,
-                    bos_token_id,
-                )
-            else:
-                val_loss, val_bpb = eval_val(
-                    args,
-                    model,
-                    rank,
-                    world_size,
-                    device,
-                    grad_accum_steps,
-                    val_tokens,
-                    base_bytes_lut,
-                    has_leading_space_lut,
-                    is_boundary_token_lut,
-                )
+            val_loss, val_bpb, eval_mode = run_validation(
+                args,
+                model,
+                base_model,
+                rank,
+                world_size,
+                device,
+                grad_accum_steps,
+                val_tokens,
+                val_tokens_ttt,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+                ttt_params,
+                bos_token_id,
+            )
             eval_time_ms = 1000.0 * (time.perf_counter() - t_eval)
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"eval_mode:{('ttt:' + args.ttt_scope) if args.ttt_enable else 'standard'} eval_time:{eval_time_ms:.0f}ms"
+                f"eval_mode:{eval_mode} eval_time:{eval_time_ms:.0f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1462,6 +1607,10 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        if ema_state is not None:
+            with torch.no_grad():
+                for name, tensor in base_model.state_dict().items():
+                    ema_state[name].mul_(args.ema_decay).add_(tensor.detach().float(), alpha=1.0 - args.ema_decay)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1488,6 +1637,11 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if ema_state is not None:
+        log0("ema:applying shadow weights")
+        current_state = base_model.state_dict()
+        avg_state = {name: tensor.to(dtype=current_state[name].dtype) for name, tensor in ema_state.items()}
+        base_model.load_state_dict(avg_state, strict=True)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1529,38 +1683,26 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    if args.ttt_enable:
-        q_val_loss, q_val_bpb = eval_val_ttt(
-            args,
-            base_model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens_ttt,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            ttt_params,
-            bos_token_id,
-        )
-    else:
-        q_val_loss, q_val_bpb = eval_val(
-            args,
-            model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-        )
+    q_val_loss, q_val_bpb, q_eval_mode = run_validation(
+        args,
+        model,
+        base_model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        val_tokens_ttt,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        ttt_params,
+        bos_token_id,
+    )
     torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        f"eval_mode:{q_eval_mode} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
