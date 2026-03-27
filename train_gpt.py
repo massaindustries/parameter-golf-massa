@@ -52,6 +52,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+    ttt_mode = os.environ.get("TTT_MODE", "params").strip().lower()
     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
     ttt_prefix_tokens = int(os.environ.get("TTT_PREFIX_TOKENS", 128))
     ttt_steps = int(os.environ.get("TTT_STEPS", 1))
@@ -60,6 +61,11 @@ class Hyperparameters:
     ttt_param_patterns = tuple(
         pattern for pattern in os.environ.get("TTT_PARAM_PATTERNS", "attn_scale,mlp_scale,resid_mix").split(",") if pattern
     )
+    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 4))
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.01))
+    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 64))
+    ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
+    ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 32))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -398,6 +404,221 @@ def _find_documents_by_bos(all_tokens: Tensor, bos_token_id: int, *, include_nex
     return docs
 
 
+class BatchedLinearLoRA(nn.Module):
+    def __init__(self, bsz: int, in_features: int, out_features: int, rank: int):
+        super().__init__()
+        self.in_features = in_features
+        self.A = nn.Parameter(torch.empty(bsz, rank, in_features))
+        self.B = nn.Parameter(torch.zeros(bsz, out_features, rank))
+        self.reset()
+
+    def forward(self, x: Tensor) -> Tensor:
+        return (x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2)
+
+    def reset(self) -> None:
+        bound = 1.0 / math.sqrt(self.in_features)
+        with torch.no_grad():
+            self.A.uniform_(-bound, bound)
+            self.B.zero_()
+
+
+class BatchedTTTLoRA(nn.Module):
+    def __init__(self, bsz: int, model: GPT, rank: int):
+        super().__init__()
+        dim = model.tok_emb.embedding_dim
+        vocab = model.tok_emb.num_embeddings
+        self.lm_head_lora = BatchedLinearLoRA(bsz, dim, vocab, rank)
+        self.q_loras = nn.ModuleList()
+        self.v_loras = nn.ModuleList()
+        for block in model.blocks:
+            self.q_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_q.weight.shape[0], rank))
+            self.v_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_v.weight.shape[0], rank))
+
+    def reset(self) -> None:
+        for module in self.modules():
+            if isinstance(module, BatchedLinearLoRA):
+                module.reset()
+
+
+def eval_val_ttt_lora(
+    args: Hyperparameters,
+    base_model: GPT,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    bos_token_id: int,
+) -> tuple[float, float]:
+    if args.ttt_scope != "document":
+        raise ValueError("TTT_MODE=lora currently requires TTT_SCOPE=document")
+
+    t_start = time.perf_counter()
+    docs = _find_documents_by_bos(val_tokens, bos_token_id, include_next_bos=True)
+    my_doc_start = (len(docs) * rank) // world_size
+    my_doc_end = (len(docs) * (rank + 1)) // world_size
+    my_docs = docs[my_doc_start:my_doc_end]
+
+    chunk_size = max(args.ttt_chunk_size, 1)
+    eval_seq_len = max(args.ttt_eval_seq_len, chunk_size)
+    batch_size = max(args.ttt_batch_size, 1)
+    lora_rank = max(args.ttt_lora_rank, 1)
+    my_docs.sort(key=lambda doc: max((doc[1] - 2 + chunk_size - 1) // chunk_size, 0))
+
+    all_params = list(base_model.parameters())
+    requires_grad_flags = [param.requires_grad for param in all_params]
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    adapted_doc_count = 0
+    skipped_doc_count = 0
+    adapted_chunk_count = 0
+    optimizer_steps = 0
+
+    try:
+        base_model.eval()
+        for param in all_params:
+            param.requires_grad_(False)
+
+        shared_lora = BatchedTTTLoRA(batch_size, base_model, lora_rank).to(device)
+        shared_optimizer = torch.optim.Adam(
+            shared_lora.parameters(),
+            lr=args.ttt_lora_lr,
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+        )
+
+        for batch_doc_start in range(0, len(my_docs), batch_size):
+            batch = my_docs[batch_doc_start : batch_doc_start + batch_size]
+            bsz = len(batch)
+            if bsz == batch_size:
+                lora = shared_lora
+                optimizer = shared_optimizer
+                lora.reset()
+                _reset_ttt_optimizer_state(optimizer)
+            else:
+                lora = BatchedTTTLoRA(bsz, base_model, lora_rank).to(device)
+                optimizer = torch.optim.Adam(
+                    lora.parameters(),
+                    lr=args.ttt_lora_lr,
+                    betas=(args.beta1, args.beta2),
+                    eps=args.adam_eps,
+                )
+
+            pred_lens = [doc_len - 1 for _, doc_len in batch]
+            num_chunks = [max((pred_len + chunk_size - 1) // chunk_size, 1) for pred_len in pred_lens]
+            doc_adapted = [False] * bsz
+
+            for chunk_idx in range(max(num_chunks)):
+                active = [chunk_idx < total_chunks for total_chunks in num_chunks]
+                if not any(active):
+                    continue
+
+                context_size = min(eval_seq_len, (chunk_idx + 1) * chunk_size)
+                x = torch.zeros(bsz, context_size, dtype=torch.int64, device=device)
+                y = torch.full((bsz, context_size), -100, dtype=torch.int64, device=device)
+                doc_info: list[tuple[int, int, bool] | None] = []
+
+                for doc_idx, is_active in enumerate(active):
+                    if not is_active:
+                        doc_info.append(None)
+                        continue
+                    doc_start, doc_len = batch[doc_idx]
+                    pred_len = pred_lens[doc_idx]
+                    chunk_start = chunk_idx * chunk_size
+                    chunk_end = min(pred_len, chunk_start + chunk_size)
+                    win_start = max(0, chunk_end - context_size)
+                    win_len = chunk_end - win_start
+                    chunk_offset = chunk_start - win_start
+                    chunk_len = chunk_end - chunk_start
+                    has_future_chunk = chunk_idx + 1 < num_chunks[doc_idx]
+                    tokens = val_tokens[doc_start + win_start : doc_start + chunk_end + 1]
+                    tokens = tokens.to(device=device, dtype=torch.int64, non_blocking=True)
+                    x[doc_idx, :win_len] = tokens[:-1]
+                    y[doc_idx, :win_len] = tokens[1:]
+                    doc_info.append((chunk_offset, chunk_len, has_future_chunk))
+
+                needs_train = any(info is not None and info[2] for info in doc_info)
+                if needs_train:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        ptl = base_model(x, y, lora=lora, reduction="none")
+                else:
+                    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        ptl = base_model(x, y, lora=lora, reduction="none")
+
+                with torch.no_grad():
+                    for doc_idx, info in enumerate(doc_info):
+                        if info is None:
+                            continue
+                        chunk_offset, chunk_len, _ = info
+                        scored_nll = ptl[doc_idx, chunk_offset : chunk_offset + chunk_len].to(torch.float64)
+                        loss_sum += scored_nll.sum()
+                        token_count += float(chunk_len)
+                        prev_ids = x[doc_idx, chunk_offset : chunk_offset + chunk_len]
+                        tgt_ids = y[doc_idx, chunk_offset : chunk_offset + chunk_len]
+                        token_bytes = base_bytes_lut[tgt_ids].to(torch.float64)
+                        token_bytes += (
+                            has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
+                        ).to(torch.float64)
+                        byte_count += token_bytes.sum()
+
+                if needs_train:
+                    train_losses = []
+                    for doc_idx, info in enumerate(doc_info):
+                        if info is None:
+                            continue
+                        chunk_offset, chunk_len, has_future_chunk = info
+                        if not has_future_chunk:
+                            continue
+                        train_losses.append(ptl[doc_idx, chunk_offset : chunk_offset + chunk_len].mean())
+                        doc_adapted[doc_idx] = True
+                    if train_losses:
+                        optimizer.zero_grad(set_to_none=True)
+                        torch.stack(train_losses).sum().backward()
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        adapted_chunk_count += len(train_losses)
+                        optimizer_steps += 1
+
+            adapted_doc_count += sum(1 for adapted in doc_adapted if adapted)
+            skipped_doc_count += sum(1 for adapted in doc_adapted if not adapted)
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+            ttt_stats = torch.tensor(
+                [adapted_doc_count, skipped_doc_count, adapted_chunk_count, optimizer_steps],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(ttt_stats, op=dist.ReduceOp.SUM)
+            adapted_doc_count = int(ttt_stats[0].item())
+            skipped_doc_count = int(ttt_stats[1].item())
+            adapted_chunk_count = int(ttt_stats[2].item())
+            optimizer_steps = int(ttt_stats[3].item())
+    finally:
+        for param, requires_grad in zip(all_params, requires_grad_flags, strict=True):
+            param.requires_grad_(requires_grad)
+        base_model.train()
+
+    val_loss = loss_sum / token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    if rank == 0:
+        elapsed_ms = 1000.0 * (time.perf_counter() - t_start)
+        print(
+            f"ttt_eval mode:lora scope:document docs:{len(docs)} adapted_docs:{adapted_doc_count} "
+            f"skipped_docs:{skipped_doc_count} adapted_chunks:{adapted_chunk_count} "
+            f"optimizer_steps:{optimizer_steps} chunk_size:{chunk_size} eval_seq_len:{eval_seq_len} "
+            f"lora_rank:{lora_rank} elapsed_ms:{elapsed_ms:.0f}",
+            flush=True,
+        )
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
 def eval_val_ttt_sequence(
     args: Hyperparameters,
     model: nn.Module,
@@ -707,7 +928,7 @@ def eval_val_ttt_document(
 
 def eval_val_ttt(
     args: Hyperparameters,
-    model: nn.Module,
+    model: GPT,
     rank: int,
     world_size: int,
     device: torch.device,
@@ -719,6 +940,19 @@ def eval_val_ttt(
     ttt_params: list[Tensor],
     bos_token_id: int,
 ) -> tuple[float, float]:
+    if args.ttt_mode == "lora":
+        return eval_val_ttt_lora(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            bos_token_id,
+        )
     if args.ttt_scope == "document":
         return eval_val_ttt_document(
             args,
@@ -779,7 +1013,7 @@ def run_validation(
             ttt_params,
             bos_token_id,
         )
-        return val_loss, val_bpb, f"ttt:{args.ttt_scope}"
+        return val_loss, val_bpb, f"ttt:{args.ttt_mode}:{args.ttt_scope}"
 
     if 0 < args.eval_stride < args.train_seq_len:
         val_loss, val_bpb = eval_val_sliding(
@@ -1115,11 +1349,17 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, *, q_lora: nn.Module | None = None, v_lora: nn.Module | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(x)
+        if q_lora is not None:
+            q = q + q_lora(x).to(dtype=q.dtype)
+        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x)
+        if v_lora is not None:
+            v = v + v_lora(x).to(dtype=v.dtype)
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -1171,10 +1411,10 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, *, q_lora: nn.Module | None = None, v_lora: nn.Module | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), q_lora=q_lora, v_lora=v_lora)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -1232,7 +1472,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward_logits(self, input_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor, *, lora: nn.Module | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1240,12 +1480,17 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            q_lora = lora.q_loras[i] if lora is not None else None
+            v_lora = lora.v_loras[i] if lora is not None else None
+            x = self.blocks[i](x, x0, q_lora=q_lora, v_lora=v_lora)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block_idx = self.num_encoder_layers + i
+            q_lora = lora.q_loras[block_idx] if lora is not None else None
+            v_lora = lora.v_loras[block_idx] if lora is not None else None
+            x = self.blocks[block_idx](x, x0, q_lora=q_lora, v_lora=v_lora)
 
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1254,12 +1499,31 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
+        if lora is not None:
+            logits_proj = logits_proj + lora.lm_head_lora(x).to(dtype=logits_proj.dtype)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        logits = self.forward_logits(input_ids).reshape(-1, self.tok_emb.num_embeddings)
-        targets = target_ids.reshape(-1)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        *,
+        lora: nn.Module | None = None,
+        reduction: str = "mean",
+    ) -> Tensor:
+        logits = self.forward_logits(input_ids, lora=lora)
+        bsz, seqlen, vocab = logits.shape
+        losses = F.cross_entropy(
+            logits.reshape(-1, vocab).float(),
+            target_ids.reshape(-1),
+            reduction="none",
+        ).reshape(bsz, seqlen)
+        if reduction == "none":
+            return losses
+        if reduction != "mean":
+            raise ValueError(f"Unsupported reduction={reduction}")
+        valid_targets = target_ids.ne(-100)
+        return losses.sum() / valid_targets.sum().clamp_min(1)
 
 
 # -----------------------------
@@ -1350,6 +1614,8 @@ def main() -> None:
     bos_token_id = int(sp.bos_id())
     if args.ttt_enable and args.ttt_scope == "document" and bos_token_id < 0:
         raise ValueError("TTT_SCOPE=document requires a tokenizer with a valid BOS token id")
+    if args.ttt_enable and args.ttt_mode == "lora" and args.ttt_scope != "document":
+        raise ValueError("TTT_MODE=lora currently requires TTT_SCOPE=document")
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
@@ -1446,13 +1712,21 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(
-        f"ttt:enabled={args.ttt_enable} prefix_tokens:{args.ttt_prefix_tokens} "
-        f"scope:{args.ttt_scope} steps:{args.ttt_steps} lr:{args.ttt_lr} "
-        f"max_prefix_fraction:{args.ttt_max_prefix_fraction:.2f} "
-        f"matched_params:{sum(int(p.numel()) for p in ttt_params)} "
-        f"patterns:{','.join(args.ttt_param_patterns)}"
-    )
+    if args.ttt_mode == "lora":
+        log0(
+            f"ttt:enabled={args.ttt_enable} mode:{args.ttt_mode} scope:{args.ttt_scope} "
+            f"lora_rank:{args.ttt_lora_rank} lora_lr:{args.ttt_lora_lr} "
+            f"chunk_size:{args.ttt_chunk_size} eval_seq_len:{args.ttt_eval_seq_len} "
+            f"batch_size:{args.ttt_batch_size}"
+        )
+    else:
+        log0(
+            f"ttt:enabled={args.ttt_enable} mode:{args.ttt_mode} prefix_tokens:{args.ttt_prefix_tokens} "
+            f"scope:{args.ttt_scope} steps:{args.ttt_steps} lr:{args.ttt_lr} "
+            f"max_prefix_fraction:{args.ttt_max_prefix_fraction:.2f} "
+            f"matched_params:{sum(int(p.numel()) for p in ttt_params)} "
+            f"patterns:{','.join(args.ttt_param_patterns)}"
+        )
     log0(f"eval:stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
     log0(f"ema:enabled={args.ema_enabled} decay:{args.ema_decay}")
     if args.ttt_enable and args.eval_stride > 0:
