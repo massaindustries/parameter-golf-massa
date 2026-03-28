@@ -1273,11 +1273,21 @@ class Rotary(nn.Module):
         self._sin_cached: Tensor | None = None
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        # Score-first TTT alternates inference-only scoring with grad-enabled eval updates.
+        # Refresh cached RoPE tables before backward if the cache was populated under inference_mode.
+        refresh_for_grad_eval = (
+            torch.is_grad_enabled()
+            and not self.training
+            and self._cos_cached is not None
+            and self._sin_cached is not None
+            and (self._cos_cached.is_inference() or self._sin_cached.is_inference())
+        )
         if (
             self._cos_cached is None
             or self._sin_cached is None
             or self._seq_len_cached != seq_len
             or self._cos_cached.device != device
+            or refresh_for_grad_eval
         ):
             t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
             freqs = torch.outer(t, self.inv_freq.to(device))
