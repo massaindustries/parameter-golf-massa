@@ -81,6 +81,7 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -1171,12 +1172,15 @@ class Block(nn.Module):
         rope_base: float,
         rope_dims: int,
         qk_gain_init: float,
+        layer_idx: int,
+        ln_scale: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, rope_dims, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -1184,9 +1188,11 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_in = self.attn_norm(x) * self.ln_scale_factor
+        attn_out = self.attn(attn_in)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_in = self.mlp_norm(x) * self.ln_scale_factor
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_in)
         return x
 
 
@@ -1205,6 +1211,7 @@ class GPT(nn.Module):
         rope_base: float,
         rope_dims: int,
         qk_gain_init: float,
+        ln_scale: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1227,6 +1234,8 @@ class GPT(nn.Module):
                     rope_base,
                     rope_dims,
                     qk_gain_init,
+                    i,
+                    ln_scale,
                 )
                 for i in range(num_layers)
             ]
@@ -1394,6 +1403,7 @@ def main() -> None:
         rope_base=args.rope_base,
         rope_dims=args.rope_dims,
         qk_gain_init=args.qk_gain_init,
+        ln_scale=args.ln_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1474,6 +1484,7 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"rope:base:{args.rope_base} dims:{args.rope_dims}")
+    log0(f"bridge:ln_scale:{int(args.ln_scale)}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
