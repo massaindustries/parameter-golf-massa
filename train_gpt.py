@@ -52,10 +52,14 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+    ttt_protocol = os.environ.get("TTT_PROTOCOL", "prefix").strip().lower()
     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
     ttt_prefix_tokens = int(os.environ.get("TTT_PREFIX_TOKENS", 128))
     ttt_steps = int(os.environ.get("TTT_STEPS", 1))
     ttt_lr = float(os.environ.get("TTT_LR", 0.01))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.0))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_max_prefix_fraction = float(os.environ.get("TTT_MAX_PREFIX_FRACTION", 0.5))
     ttt_param_patterns = tuple(
         pattern for pattern in os.environ.get("TTT_PARAM_PATTERNS", "attn_scale,mlp_scale,resid_mix").split(",") if pattern
@@ -382,6 +386,22 @@ def _reset_ttt_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
     optimizer.state.clear()
 
 
+def _build_ttt_optimizer(args: Hyperparameters, ttt_params: list[Tensor]) -> torch.optim.Optimizer:
+    return torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+
+
+def _set_ttt_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def _score_first_chunk_lr(base_lr: float, chunk_idx: int, total_adapt_chunks: int) -> float:
+    if total_adapt_chunks <= 1:
+        return base_lr
+    progress = chunk_idx / max(total_adapt_chunks - 1, 1)
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
 def _find_documents_by_bos(all_tokens: Tensor, bos_token_id: int, *, include_next_bos: bool = True) -> list[tuple[int, int]]:
     bos_positions = (all_tokens == bos_token_id).nonzero(as_tuple=True)[0].cpu().tolist()
     if not bos_positions:
@@ -397,6 +417,81 @@ def _find_documents_by_bos(all_tokens: Tensor, bos_token_id: int, *, include_nex
     if not docs:
         raise ValueError("No non-empty documents found in validation split")
     return docs
+
+
+def _sliding_window_specs(total_tokens: int, seq_len: int, stride: int) -> list[tuple[int, int, int, int]]:
+    specs: list[tuple[int, int, int, int]] = []
+    for window_start in range(0, total_tokens, stride):
+        window_end = min(window_start + seq_len, total_tokens)
+        window_len = window_end - window_start
+        if window_len < 1:
+            continue
+        score_start = 0 if window_start == 0 else max(window_len - stride, 0)
+        specs.append((window_start, window_len, score_start, window_len - score_start))
+    return specs
+
+
+def _build_score_first_chunks(
+    total_tokens: int, seq_len: int, stride: int, chunk_tokens: int
+) -> list[list[tuple[int, int, int, int]]]:
+    chunked_specs: list[list[tuple[int, int, int, int]]] = []
+    current_chunk: list[tuple[int, int, int, int]] = []
+    current_chunk_id: int | None = None
+    for spec in _sliding_window_specs(total_tokens, seq_len, stride):
+        window_start, window_len, score_start, _ = spec
+        scored_start = window_start + score_start
+        scored_end = window_start + window_len
+        start_chunk_id = scored_start // chunk_tokens
+        end_chunk_id = (scored_end - 1) // chunk_tokens
+        if start_chunk_id != end_chunk_id:
+            raise ValueError(
+                "TTT_CHUNK_TOKENS must align with the active score-first scoring stride; "
+                f"got TTT_CHUNK_TOKENS={chunk_tokens}, EVAL_STRIDE={stride}, TRAIN_SEQ_LEN={seq_len}"
+            )
+        if current_chunk_id is None or end_chunk_id != current_chunk_id:
+            if current_chunk:
+                chunked_specs.append(current_chunk)
+            current_chunk = []
+            current_chunk_id = end_chunk_id
+        current_chunk.append(spec)
+    if current_chunk:
+        chunked_specs.append(current_chunk)
+    return chunked_specs
+
+
+def _adapt_ttt_chunk(
+    args: Hyperparameters,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    chunk_tokens: Tensor,
+    device: torch.device,
+    ttt_params: list[Tensor],
+    lr: float,
+) -> int:
+    pred_tokens = int(chunk_tokens.numel()) - 1
+    if pred_tokens <= 0 or args.ttt_epochs <= 0:
+        return 0
+    seq_len = args.train_seq_len
+    stride = args.eval_stride if 0 < args.eval_stride < seq_len else seq_len
+    update_steps = 0
+    _set_ttt_optimizer_lr(optimizer, lr)
+    for _ in range(args.ttt_epochs):
+        for window_start, window_len, _, _ in _sliding_window_specs(pred_tokens, seq_len, stride):
+            local = chunk_tokens[window_start : window_start + window_len + 1].to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
+            x = local[:-1].unsqueeze(0)
+            y = local[1:].unsqueeze(0)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss = model(x, y)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(ttt_params, args.grad_clip_norm)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            update_steps += 1
+    return update_steps
 
 
 def eval_val_ttt_sequence(
@@ -436,7 +531,7 @@ def eval_val_ttt_sequence(
     initial_values = [param.detach().clone() for param in ttt_params]
     all_params = list(model.parameters())
     requires_grad_flags = [param.requires_grad for param in all_params]
-    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr)
+    optimizer = _build_ttt_optimizer(args, ttt_params)
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -575,7 +670,7 @@ def eval_val_ttt_document(
     initial_values = [param.detach().clone() for param in ttt_params]
     all_params = list(model.parameters())
     requires_grad_flags = [param.requires_grad for param in all_params]
-    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr)
+    optimizer = _build_ttt_optimizer(args, ttt_params)
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -706,6 +801,127 @@ def eval_val_ttt_document(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
+def eval_val_ttt_score_first_global(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    ttt_params: list[Tensor],
+) -> tuple[float, float]:
+    if world_size != 1:
+        raise ValueError("TTT_PROTOCOL=score_first with TTT_SCOPE=global currently requires WORLD_SIZE=1")
+    if not ttt_params:
+        raise ValueError("TTT is enabled but no adaptable parameters matched TTT_PARAM_PATTERNS")
+    if not (0 < args.eval_stride < args.train_seq_len):
+        raise ValueError("TTT_PROTOCOL=score_first with TTT_SCOPE=global requires 0 < EVAL_STRIDE < TRAIN_SEQ_LEN")
+    t_start = time.perf_counter()
+    seq_len = args.train_seq_len
+    stride = args.eval_stride
+    total_tokens = val_tokens.numel() - 1
+    chunk_tokens = max(args.ttt_chunk_tokens, seq_len)
+    chunked_specs = _build_score_first_chunks(total_tokens, seq_len, stride, chunk_tokens)
+    initial_values = [param.detach().clone() for param in ttt_params]
+    all_params = list(model.parameters())
+    requires_grad_flags = [param.requires_grad for param in all_params]
+    optimizer = _build_ttt_optimizer(args, ttt_params)
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    adapted_chunk_count = 0
+    total_update_steps = 0
+    total_adapt_chunks = max(len(chunked_specs) - 1, 0)
+    lr_first = _score_first_chunk_lr(args.ttt_lr, 0, total_adapt_chunks) if total_adapt_chunks > 0 else args.ttt_lr
+    lr_last = (
+        _score_first_chunk_lr(args.ttt_lr, total_adapt_chunks - 1, total_adapt_chunks)
+        if total_adapt_chunks > 0
+        else args.ttt_lr
+    )
+
+    try:
+        model.eval()
+        for param in all_params:
+            param.requires_grad_(False)
+        for param in ttt_params:
+            param.requires_grad_(True)
+
+        for chunk_idx, chunk_specs in enumerate(chunked_specs):
+            for batch_idx in range(0, len(chunk_specs), args.eval_batch_seqs):
+                batch_specs = chunk_specs[batch_idx : batch_idx + args.eval_batch_seqs]
+                batch_size = len(batch_specs)
+                x_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
+                y_batch = torch.zeros(batch_size, seq_len, dtype=torch.int64, device=device)
+
+                for row_idx, (window_start, window_len, _, _) in enumerate(batch_specs):
+                    chunk = val_tokens[window_start : window_start + window_len + 1].to(
+                        device=device, dtype=torch.int64, non_blocking=True
+                    )
+                    x_batch[row_idx, :window_len] = chunk[:-1]
+                    y_batch[row_idx, :window_len] = chunk[1:]
+
+                with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits = model.forward_logits(x_batch)
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape(batch_size, seq_len)
+
+                for row_idx, (_, window_len, score_start, _) in enumerate(batch_specs):
+                    scored_nll = nll[row_idx, score_start:window_len].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    token_count += float(window_len - score_start)
+                    tgt_ids = y_batch[row_idx, score_start:window_len]
+                    prev_ids = x_batch[row_idx, score_start:window_len]
+                    token_bytes = base_bytes_lut[tgt_ids].to(torch.float64)
+                    token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
+                    byte_count += token_bytes.sum()
+
+            has_future_chunk = chunk_idx + 1 < len(chunked_specs)
+            if has_future_chunk and args.ttt_epochs > 0:
+                chunk_start = chunk_idx * chunk_tokens
+                chunk_end = min(total_tokens, chunk_start + chunk_tokens)
+                chunk_lr = _score_first_chunk_lr(args.ttt_lr, chunk_idx, total_adapt_chunks)
+                update_steps = _adapt_ttt_chunk(
+                    args,
+                    model,
+                    optimizer,
+                    val_tokens[chunk_start : chunk_end + 1],
+                    device,
+                    ttt_params,
+                    chunk_lr,
+                )
+                if update_steps > 0:
+                    adapted_chunk_count += 1
+                    total_update_steps += update_steps
+    finally:
+        _reset_ttt_params(ttt_params, initial_values)
+        optimizer.zero_grad(set_to_none=True)
+        for param, requires_grad in zip(all_params, requires_grad_flags, strict=True):
+            param.requires_grad_(requires_grad)
+        model.train()
+
+    val_loss = loss_sum / token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    if rank == 0:
+        elapsed_ms = 1000.0 * (time.perf_counter() - t_start)
+        print(
+            f"ttt_eval protocol:score_first scope:global scored_chunks:{len(chunked_specs)} "
+            f"adapted_chunks:{adapted_chunk_count} update_steps:{total_update_steps} "
+            f"stride_active:1 stride:{stride} chunk_tokens:{chunk_tokens} "
+            f"epochs:{max(args.ttt_epochs, 0)} momentum:{args.ttt_momentum:.3f} "
+            f"lr_schedule:cosine lr_first:{lr_first:.6f} lr_last:{lr_last:.6f} "
+            f"elapsed_ms:{elapsed_ms:.0f}",
+            flush=True,
+        )
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
 def eval_val_ttt(
     args: Hyperparameters,
     model: nn.Module,
@@ -720,6 +936,21 @@ def eval_val_ttt(
     ttt_params: list[Tensor],
     bos_token_id: int,
 ) -> tuple[float, float]:
+    if args.ttt_protocol == "score_first":
+        if args.ttt_scope != "global":
+            raise ValueError("TTT_PROTOCOL=score_first currently requires TTT_SCOPE=global")
+        return eval_val_ttt_score_first_global(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            ttt_params,
+        )
     if args.ttt_scope == "document":
         return eval_val_ttt_document(
             args,
@@ -780,7 +1011,7 @@ def run_validation(
             ttt_params,
             bos_token_id,
         )
-        return val_loss, val_bpb, f"ttt:{args.ttt_scope}"
+        return val_loss, val_bpb, f"ttt:{args.ttt_protocol}:{args.ttt_scope}"
 
     if 0 < args.eval_stride < args.train_seq_len:
         val_loss, val_bpb = eval_val_sliding(
@@ -1068,11 +1299,19 @@ class Rotary(nn.Module):
         self._sin_cached: Tensor | None = None
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        refresh_for_grad_eval = (
+            torch.is_grad_enabled()
+            and not self.training
+            and self._cos_cached is not None
+            and self._sin_cached is not None
+            and (self._cos_cached.is_inference() or self._sin_cached.is_inference())
+        )
         if (
             self._cos_cached is None
             or self._sin_cached is None
             or self._seq_len_cached != seq_len
             or self._cos_cached.device != device
+            or refresh_for_grad_eval
         ):
             t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
             freqs = torch.outer(t, self.inv_freq.to(device))
@@ -1362,6 +1601,8 @@ def main() -> None:
     bos_token_id = int(sp.bos_id())
     if args.ttt_enable and args.ttt_scope == "document" and bos_token_id < 0:
         raise ValueError("TTT_SCOPE=document requires a tokenizer with a valid BOS token id")
+    if args.ttt_enable and args.ttt_protocol == "score_first" and args.ttt_scope != "global":
+        raise ValueError("TTT_PROTOCOL=score_first currently requires TTT_SCOPE=global")
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
@@ -1460,8 +1701,9 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(
-        f"ttt:enabled={args.ttt_enable} prefix_tokens:{args.ttt_prefix_tokens} "
+        f"ttt:enabled={args.ttt_enable} protocol:{args.ttt_protocol} prefix_tokens:{args.ttt_prefix_tokens} "
         f"scope:{args.ttt_scope} steps:{args.ttt_steps} lr:{args.ttt_lr} "
+        f"momentum:{args.ttt_momentum:.3f} epochs:{args.ttt_epochs} chunk_tokens:{args.ttt_chunk_tokens} "
         f"max_prefix_fraction:{args.ttt_max_prefix_fraction:.2f} "
         f"matched_params:{sum(int(p.numel()) for p in ttt_params)} "
         f"patterns:{','.join(args.ttt_param_patterns)}"
@@ -1469,7 +1711,10 @@ def main() -> None:
     log0(f"eval:stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
     log0(f"ema:enabled={args.ema_enabled} decay:{args.ema_decay}")
     if args.ttt_enable and args.eval_stride > 0:
-        log0(f"eval_stride_ignored_due_to_ttt:{args.eval_stride}")
+        if args.ttt_protocol == "score_first" and args.ttt_scope == "global":
+            log0(f"eval_stride_preserved_with_ttt:{args.eval_stride}")
+        else:
+            log0(f"eval_stride_ignored_due_to_ttt:{args.eval_stride}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
