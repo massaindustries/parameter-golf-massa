@@ -60,6 +60,7 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.0))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    ttt_c_v_carrier_rank = int(os.environ.get("TTT_CV_CARRIER_RANK", 0))
     ttt_max_prefix_fraction = float(os.environ.get("TTT_MAX_PREFIX_FRACTION", 0.5))
     ttt_param_patterns = tuple(
         pattern for pattern in os.environ.get("TTT_PARAM_PATTERNS", "attn_scale,mlp_scale,resid_mix").split(",") if pattern
@@ -1290,6 +1291,18 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class FastWeightCarrier(nn.Module):
+    # Tiny zero-init residual path used as a dedicated TTT write surface.
+    def __init__(self, in_features: int, out_features: int, rank: int):
+        super().__init__()
+        self.down = CastedLinear(in_features, rank, bias=False)
+        self.up = CastedLinear(rank, out_features, bias=False)
+        self.up._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.up(self.down(x))
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -1346,6 +1359,7 @@ class CausalSelfAttention(nn.Module):
         rope_base: float,
         rope_dims: int,
         qk_gain_init: float,
+        c_v_carrier_rank: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -1364,6 +1378,7 @@ class CausalSelfAttention(nn.Module):
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v_carrier = FastWeightCarrier(dim, kv_dim, c_v_carrier_rank) if c_v_carrier_rank > 0 else None
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -1373,7 +1388,10 @@ class CausalSelfAttention(nn.Module):
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x)
+        if self.c_v_carrier is not None:
+            v = v + self.c_v_carrier(x).to(dtype=v.dtype)
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -1420,11 +1438,20 @@ class Block(nn.Module):
         rope_base: float,
         rope_dims: int,
         qk_gain_init: float,
+        c_v_carrier_rank: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, rope_dims, qk_gain_init)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            rope_dims,
+            qk_gain_init,
+            c_v_carrier_rank,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1454,6 +1481,7 @@ class GPT(nn.Module):
         rope_base: float,
         rope_dims: int,
         qk_gain_init: float,
+        ttt_c_v_carrier_rank: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1476,6 +1504,7 @@ class GPT(nn.Module):
                     rope_base,
                     rope_dims,
                     qk_gain_init,
+                    ttt_c_v_carrier_rank if i == num_layers - 1 else 0,
                 )
                 for i in range(num_layers)
             ]
@@ -1645,6 +1674,7 @@ def main() -> None:
         rope_base=args.rope_base,
         rope_dims=args.rope_dims,
         qk_gain_init=args.qk_gain_init,
+        ttt_c_v_carrier_rank=args.ttt_c_v_carrier_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1714,6 +1744,7 @@ def main() -> None:
         f"ttt:enabled={args.ttt_enable} protocol:{args.ttt_protocol} prefix_tokens:{args.ttt_prefix_tokens} "
         f"scope:{args.ttt_scope} steps:{args.ttt_steps} lr:{args.ttt_lr} "
         f"momentum:{args.ttt_momentum:.3f} epochs:{args.ttt_epochs} chunk_tokens:{args.ttt_chunk_tokens} "
+        f"c_v_carrier_rank:{args.ttt_c_v_carrier_rank} "
         f"max_prefix_fraction:{args.ttt_max_prefix_fraction:.2f} "
         f"matched_params:{sum(int(p.numel()) for p in ttt_params)} "
         f"patterns:{','.join(args.ttt_param_patterns)}"
