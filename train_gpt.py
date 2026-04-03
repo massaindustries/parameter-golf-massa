@@ -85,6 +85,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -1430,6 +1431,16 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dims, base=rope_base)
+        self.use_xsa = False
+
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        bsz, seqlen, num_heads, head_dim = y.shape
+        num_kv_heads = v.size(2)
+        group = num_heads // num_kv_heads
+        y_grouped = y.reshape(bsz, seqlen, num_kv_heads, group, head_dim)
+        value_dir = F.normalize(v, dim=-1).unsqueeze(-2)
+        value_proj = (y_grouped * value_dir).sum(dim=-1, keepdim=True) * value_dir
+        return (y_grouped - value_proj).reshape(bsz, seqlen, num_heads, head_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -1457,7 +1468,11 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        y = y.transpose(1, 2).contiguous()
+        if self.use_xsa:
+            # XSA-lite: remove the value-direction component on the deepest layers only.
+            y = self._xsa_efficient(y, v.transpose(1, 2).contiguous())
+        y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -1527,6 +1542,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         rope_dims: int,
+        xsa_last_n: int,
         qk_gain_init: float,
         ttt_c_v_carrier_rank: int,
     ):
@@ -1556,6 +1572,9 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        if xsa_last_n > 0:
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1720,6 +1739,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         rope_dims=args.rope_dims,
+        xsa_last_n=args.xsa_last_n,
         qk_gain_init=args.qk_gain_init,
         ttt_c_v_carrier_rank=args.ttt_c_v_carrier_rank,
     ).to(device).bfloat16()
@@ -1786,6 +1806,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    xsa_layers = [i for i, block in enumerate(base_model.blocks) if block.attn.use_xsa]
     log0(f"model_params:{n_params}")
     log0(
         f"ttt:enabled={args.ttt_enable} protocol:{args.ttt_protocol} prefix_tokens:{args.ttt_prefix_tokens} "
@@ -1806,6 +1827,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"xsa:last_n:{args.xsa_last_n} layers:{xsa_layers}")
     log0(f"rope:base:{args.rope_base} dims:{args.rope_dims}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
