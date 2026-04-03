@@ -1084,6 +1084,20 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT8_ROW_CLIP_SEARCH_PERCENTILES = tuple(
+    float(token)
+    for token in os.environ.get(
+        "INT8_ROW_CLIP_SEARCH_PERCENTILES",
+        f"99.9,99.95,99.99,99.999,{INT8_CLIP_PERCENTILE},100.0",
+    ).split(",")
+    if token
+)
+INT8_ROW_CLIP_SEARCH_QS = tuple(min(max(percentile / 100.0, 0.0), 1.0) for percentile in INT8_ROW_CLIP_SEARCH_PERCENTILES)
+INT8_ROW_CLIP_SEARCH_DEFAULT_INDEX = (
+    min(range(len(INT8_ROW_CLIP_SEARCH_PERCENTILES)), key=lambda i: abs(INT8_ROW_CLIP_SEARCH_PERCENTILES[i] - INT8_CLIP_PERCENTILE))
+    if INT8_ROW_CLIP_SEARCH_PERCENTILES
+    else 0
+)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -1096,26 +1110,47 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor, dict[str, object]]:
     t32 = t.float()
     if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        # Matrices get one scale per row. Search a small percentile grid and
+        # keep the row-wise clip that minimizes reconstruction MSE.
+        if t32.numel():
+            clip_qs = torch.tensor(INT8_ROW_CLIP_SEARCH_QS, dtype=torch.float32, device=t32.device)
+            clip_abs_candidates = torch.quantile(t32.abs(), clip_qs, dim=1).transpose(0, 1).contiguous()
+        else:
+            clip_abs_candidates = torch.empty(
+                (t32.shape[0], len(INT8_ROW_CLIP_SEARCH_QS)),
+                dtype=torch.float32,
+                device=t32.device,
+            )
+        scale_candidates = (clip_abs_candidates / 127.0).clamp_min(1.0 / 127.0)
+        row_values = t32[:, None, :]
+        clip_limits = clip_abs_candidates[:, :, None]
+        clipped = torch.maximum(torch.minimum(row_values, clip_limits), -clip_limits)
+        q_candidates = torch.clamp(torch.round(clipped / scale_candidates[:, :, None]), -127, 127)
+        recon = q_candidates * scale_candidates[:, :, None]
+        mse = (recon - row_values).square().mean(dim=2)
+        best_idx = mse.argmin(dim=1)
+        row_idx = torch.arange(t32.shape[0], device=t32.device)
+        scale = scale_candidates[row_idx, best_idx]
+        q = q_candidates[row_idx, best_idx].to(torch.int8).contiguous()
+        candidate_counts = torch.bincount(best_idx, minlength=len(INT8_ROW_CLIP_SEARCH_PERCENTILES)).tolist()
+        baseline_mse = mse[:, INT8_ROW_CLIP_SEARCH_DEFAULT_INDEX]
+        best_mse = mse[row_idx, best_idx]
+        search_stats = {
+            "rows": int(t32.shape[0]),
+            "candidate_counts": [int(count) for count in candidate_counts],
+            "search_win_rows": int((best_mse + 1e-12 < baseline_mse).sum().item()),
+            "mse_gain_sum": float((baseline_mse - best_mse).clamp_min(0).sum().item()),
+        }
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), search_stats
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
-    return q, scale
+    return q, scale, {}
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -1133,6 +1168,10 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
         0,
     )
+    stats["row_clip_search_rows"] = 0
+    stats["row_clip_search_win_rows"] = 0
+    stats["row_clip_search_mse_gain_sum"] = 0.0
+    stats["row_clip_search_candidate_counts"] = [0 for _ in INT8_ROW_CLIP_SEARCH_PERCENTILES]
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -1155,13 +1194,21 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
+        q, s, search_stats = quantize_float_tensor(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        if search_stats:
+            stats["row_clip_search_rows"] += int(search_stats["rows"])
+            stats["row_clip_search_win_rows"] += int(search_stats["search_win_rows"])
+            stats["row_clip_search_mse_gain_sum"] += float(search_stats["mse_gain_sum"])
+            stats["row_clip_search_candidate_counts"] = [
+                int(a) + int(b)
+                for a, b in zip(stats["row_clip_search_candidate_counts"], search_stats["candidate_counts"])
+            ]
 
     obj: dict[str, object] = {
         "__quant_format__": "int8_clean_per_row_v1",
@@ -1973,6 +2020,18 @@ def main() -> None:
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
+        if quant_stats["row_clip_search_rows"] > 0:
+            candidate_summary = ",".join(
+                f"{percentile:g}:{count}"
+                for percentile, count in zip(INT8_ROW_CLIP_SEARCH_PERCENTILES, quant_stats["row_clip_search_candidate_counts"])
+            )
+            log0(
+                "Row clip search: "
+                f"rows:{quant_stats['row_clip_search_rows']} "
+                f"wins_vs_default:{quant_stats['row_clip_search_win_rows']} "
+                f"mse_gain_sum:{quant_stats['row_clip_search_mse_gain_sum']:.6f} "
+                f"candidates:{candidate_summary}"
+            )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
