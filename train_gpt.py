@@ -105,6 +105,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", "0.0"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1332,11 +1333,25 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def fake_quantize_weight_per_row_int8(weight: Tensor) -> Tensor:
+    # Late-QAT uses a straight-through int8 row quantizer that mirrors the export's per-row scaling.
+    with torch.no_grad():
+        weight_f32 = weight.float()
+        scale = (weight_f32.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1.0 / 127.0)
+        quantized = torch.clamp(torch.round(weight_f32 / scale), -127, 127) * scale
+    return weight + (quantized.to(dtype=weight.dtype) - weight).detach()
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    _late_qat_enabled: bool = False
+
     def forward(self, x: Tensor) -> Tensor:
+        weight = self.weight
+        if CastedLinear._late_qat_enabled and self.training and weight.ndim == 2:
+            weight = fake_quantize_weight_per_row_int8(weight)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, weight.to(x.dtype), bias)
 
 
 class FastWeightCarrier(nn.Module):
@@ -1807,6 +1822,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     xsa_layers = [i for i, block in enumerate(base_model.blocks) if block.attn.use_xsa]
+    CastedLinear._late_qat_enabled = False
     log0(f"model_params:{n_params}")
     log0(
         f"ttt:enabled={args.ttt_enable} protocol:{args.ttt_protocol} prefix_tokens:{args.ttt_prefix_tokens} "
@@ -1828,6 +1844,7 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"xsa:last_n:{args.xsa_last_n} layers:{xsa_layers}")
+    log0(f"late_qat:threshold:{args.late_qat_threshold:.3f} enabled:{int(CastedLinear._late_qat_enabled)}")
     log0(f"rope:base:{args.rope_base} dims:{args.rope_dims}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -1950,6 +1967,9 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._late_qat_enabled:
+            CastedLinear._late_qat_enabled = True
+            log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
