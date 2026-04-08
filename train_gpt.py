@@ -58,9 +58,12 @@ class Hyperparameters:
     ttt_steps = int(os.environ.get("TTT_STEPS", 1))
     ttt_lr = float(os.environ.get("TTT_LR", 0.01))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.0))
+    ttt_optimizer = os.environ.get("TTT_OPTIMIZER", "sgd").strip().lower()
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_c_v_carrier_rank = int(os.environ.get("TTT_CV_CARRIER_RANK", 0))
+    ttt_muon_backend_steps = int(os.environ.get("TTT_MUON_BACKEND_STEPS", os.environ.get("MUON_BACKEND_STEPS", "5")))
+    ttt_delta_budget_ratio = float(os.environ.get("TTT_DELTA_BUDGET_RATIO", "0.0"))
     ttt_max_prefix_fraction = float(os.environ.get("TTT_MAX_PREFIX_FRACTION", 0.5))
     ttt_param_patterns = tuple(
         pattern for pattern in os.environ.get("TTT_PARAM_PATTERNS", "attn_scale,mlp_scale,resid_mix").split(",") if pattern
@@ -399,12 +402,35 @@ def _persist_runtime_log(run_id: str, msg: str) -> None:
 
 
 def _build_ttt_optimizer(args: Hyperparameters, ttt_params: list[Tensor]) -> torch.optim.Optimizer:
-    return torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    if args.ttt_optimizer == "sgd":
+        return torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    if args.ttt_optimizer == "muon":
+        if any(param.ndim != 2 for param in ttt_params):
+            raise ValueError("TTT_OPTIMIZER=muon requires all matched TTT parameters to be 2D matrices")
+        return Muon(
+            ttt_params,
+            lr=args.ttt_lr,
+            momentum=args.ttt_momentum,
+            backend_steps=max(args.ttt_muon_backend_steps, 1),
+        )
+    raise ValueError(f"Unsupported TTT_OPTIMIZER={args.ttt_optimizer!r}; expected 'sgd' or 'muon'")
 
 
 def _set_ttt_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for group in optimizer.param_groups:
         group["lr"] = lr
+
+
+def _clamp_ttt_param_delta_norms(params: list[Tensor], initial_values: list[Tensor], max_ratio: float) -> None:
+    if max_ratio <= 0:
+        return
+    with torch.no_grad():
+        for param, initial in zip(params, initial_values, strict=True):
+            delta = param - initial
+            base_norm = torch.linalg.vector_norm(initial).clamp_min(1e-12)
+            max_norm = base_norm * max_ratio
+            scale = torch.clamp(max_norm / (torch.linalg.vector_norm(delta) + 1e-12), max=1.0)
+            param.copy_(initial + delta * scale.to(dtype=delta.dtype))
 
 
 def _score_first_chunk_lr(base_lr: float, chunk_idx: int, total_adapt_chunks: int) -> float:
@@ -478,6 +504,7 @@ def _adapt_ttt_chunk(
     chunk_tokens: Tensor,
     device: torch.device,
     ttt_params: list[Tensor],
+    initial_values: list[Tensor],
     lr: float,
 ) -> int:
     pred_tokens = int(chunk_tokens.numel()) - 1
@@ -501,6 +528,7 @@ def _adapt_ttt_chunk(
             if args.grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(ttt_params, args.grad_clip_norm)
             optimizer.step()
+            _clamp_ttt_param_delta_norms(ttt_params, initial_values, args.ttt_delta_budget_ratio)
             optimizer.zero_grad(set_to_none=True)
             update_steps += 1
     return update_steps
@@ -593,6 +621,7 @@ def eval_val_ttt_sequence(
                                 prefix_loss = model(x_prefix, y_prefix)
                         prefix_loss.backward()
                         optimizer.step()
+                        _clamp_ttt_param_delta_norms(ttt_params, initial_values, args.ttt_delta_budget_ratio)
                         optimizer.zero_grad(set_to_none=True)
                     adapted_seq_count += 1
                     total_update_steps += args.ttt_steps
@@ -654,6 +683,7 @@ def eval_val_ttt_sequence(
         print(
             f"ttt_eval scope:sequence adapted_seqs:{adapted_seq_count} skipped_seqs:{skipped_seq_count} "
             f"update_steps:{total_update_steps} prefix_tokens:{prefix_len} "
+            f"optimizer:{args.ttt_optimizer} delta_budget_ratio:{args.ttt_delta_budget_ratio:.3f} "
             f"allow_ttt:{int(allow_ttt)} elapsed_ms:{elapsed_ms:.0f}",
             flush=True,
         )
@@ -740,6 +770,7 @@ def eval_val_ttt_document(
                                 prefix_loss = model(x_prefix, y_prefix)
                         prefix_loss.backward()
                         optimizer.step()
+                        _clamp_ttt_param_delta_norms(ttt_params, initial_values, args.ttt_delta_budget_ratio)
                         optimizer.zero_grad(set_to_none=True)
                     scored_targets = y.clone()
                     scored_targets[:, :prefix_len] = -100
@@ -807,7 +838,8 @@ def eval_val_ttt_document(
         print(
             f"ttt_eval scope:document docs:{len(docs)} adapted_docs:{adapted_doc_count} skipped_docs:{skipped_doc_count} "
             f"adapted_windows:{adapted_window_count} skipped_windows:{skipped_window_count} "
-            f"update_steps:{total_update_steps} elapsed_ms:{elapsed_ms:.0f}",
+            f"update_steps:{total_update_steps} optimizer:{args.ttt_optimizer} "
+            f"delta_budget_ratio:{args.ttt_delta_budget_ratio:.3f} elapsed_ms:{elapsed_ms:.0f}",
             flush=True,
         )
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
@@ -905,6 +937,7 @@ def eval_val_ttt_score_first_global(
                     val_tokens[chunk_start : chunk_end + 1],
                     device,
                     ttt_params,
+                    initial_values,
                     chunk_lr,
                 )
                 if update_steps > 0:
@@ -927,7 +960,8 @@ def eval_val_ttt_score_first_global(
             f"ttt_eval protocol:score_first scope:global scored_chunks:{len(chunked_specs)} "
             f"adapted_chunks:{adapted_chunk_count} update_steps:{total_update_steps} "
             f"stride_active:1 stride:{stride} chunk_tokens:{chunk_tokens} "
-            f"epochs:{max(args.ttt_epochs, 0)} momentum:{args.ttt_momentum:.3f} "
+            f"epochs:{max(args.ttt_epochs, 0)} optimizer:{args.ttt_optimizer} "
+            f"momentum:{args.ttt_momentum:.3f} delta_budget_ratio:{args.ttt_delta_budget_ratio:.3f} "
             f"lr_schedule:cosine lr_first:{lr_first:.6f} lr_last:{lr_last:.6f} "
             f"elapsed_ms:{elapsed_ms:.0f}",
         )
@@ -1811,7 +1845,9 @@ def main() -> None:
     log0(
         f"ttt:enabled={args.ttt_enable} protocol:{args.ttt_protocol} prefix_tokens:{args.ttt_prefix_tokens} "
         f"scope:{args.ttt_scope} steps:{args.ttt_steps} lr:{args.ttt_lr} "
-        f"momentum:{args.ttt_momentum:.3f} epochs:{args.ttt_epochs} chunk_tokens:{args.ttt_chunk_tokens} "
+        f"optimizer:{args.ttt_optimizer} momentum:{args.ttt_momentum:.3f} "
+        f"muon_backend_steps:{args.ttt_muon_backend_steps} delta_budget_ratio:{args.ttt_delta_budget_ratio:.3f} "
+        f"epochs:{args.ttt_epochs} chunk_tokens:{args.ttt_chunk_tokens} "
         f"c_v_carrier_rank:{args.ttt_c_v_carrier_rank} "
         f"max_prefix_fraction:{args.ttt_max_prefix_fraction:.2f} "
         f"matched_params:{sum(int(p.numel()) for p in ttt_params)} "
