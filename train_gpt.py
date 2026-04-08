@@ -58,6 +58,7 @@ class Hyperparameters:
     ttt_steps = int(os.environ.get("TTT_STEPS", 1))
     ttt_lr = float(os.environ.get("TTT_LR", 0.01))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.0))
+    ttt_reset_opt_state_per_chunk = bool(int(os.environ.get("TTT_RESET_OPT_STATE_PER_CHUNK", "0")))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_c_v_carrier_rank = int(os.environ.get("TTT_CV_CARRIER_RANK", 0))
@@ -898,6 +899,9 @@ def eval_val_ttt_score_first_global(
                 chunk_start = chunk_idx * chunk_tokens
                 chunk_end = min(total_tokens, chunk_start + chunk_tokens)
                 chunk_lr = _score_first_chunk_lr(args.ttt_lr, chunk_idx, total_adapt_chunks)
+                if args.ttt_reset_opt_state_per_chunk:
+                    _reset_ttt_optimizer_state(optimizer)
+                    optimizer.zero_grad(set_to_none=True)
                 update_steps = _adapt_ttt_chunk(
                     args,
                     model,
@@ -928,6 +932,7 @@ def eval_val_ttt_score_first_global(
             f"adapted_chunks:{adapted_chunk_count} update_steps:{total_update_steps} "
             f"stride_active:1 stride:{stride} chunk_tokens:{chunk_tokens} "
             f"epochs:{max(args.ttt_epochs, 0)} momentum:{args.ttt_momentum:.3f} "
+            f"reset_opt_state_per_chunk:{int(args.ttt_reset_opt_state_per_chunk)} "
             f"lr_schedule:cosine lr_first:{lr_first:.6f} lr_last:{lr_last:.6f} "
             f"elapsed_ms:{elapsed_ms:.0f}",
         )
@@ -1811,7 +1816,8 @@ def main() -> None:
     log0(
         f"ttt:enabled={args.ttt_enable} protocol:{args.ttt_protocol} prefix_tokens:{args.ttt_prefix_tokens} "
         f"scope:{args.ttt_scope} steps:{args.ttt_steps} lr:{args.ttt_lr} "
-        f"momentum:{args.ttt_momentum:.3f} epochs:{args.ttt_epochs} chunk_tokens:{args.ttt_chunk_tokens} "
+        f"momentum:{args.ttt_momentum:.3f} reset_opt_state_per_chunk:{int(args.ttt_reset_opt_state_per_chunk)} "
+        f"epochs:{args.ttt_epochs} chunk_tokens:{args.ttt_chunk_tokens} "
         f"c_v_carrier_rank:{args.ttt_c_v_carrier_rank} "
         f"max_prefix_fraction:{args.ttt_max_prefix_fraction:.2f} "
         f"matched_params:{sum(int(p.numel()) for p in ttt_params)} "
