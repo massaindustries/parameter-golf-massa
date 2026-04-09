@@ -58,6 +58,7 @@ class Hyperparameters:
     ttt_steps = int(os.environ.get("TTT_STEPS", 1))
     ttt_lr = float(os.environ.get("TTT_LR", 0.01))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.0))
+    ttt_opt_state_banks = int(os.environ.get("TTT_OPT_STATE_BANKS", "1"))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_c_v_carrier_rank = int(os.environ.get("TTT_CV_CARRIER_RANK", 0))
@@ -386,6 +387,36 @@ def _reset_ttt_params(params: list[Tensor], initial_values: list[Tensor]) -> Non
 
 def _reset_ttt_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
     optimizer.state.clear()
+
+
+def _clone_optimizer_state_value(value: object) -> object:
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {k: _clone_optimizer_state_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_optimizer_state_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_optimizer_state_value(v) for v in value)
+    return copy.deepcopy(value)
+
+
+def _capture_ttt_optimizer_state(optimizer: torch.optim.Optimizer, ttt_params: list[Tensor]) -> list[dict[object, object]]:
+    return [
+        _clone_optimizer_state_value(optimizer.state.get(param, {}))
+        for param in ttt_params
+    ]
+
+
+def _restore_ttt_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    ttt_params: list[Tensor],
+    bank_state: list[dict[object, object]],
+) -> None:
+    optimizer.state.clear()
+    for param, saved_state in zip(ttt_params, bank_state, strict=True):
+        if saved_state:
+            optimizer.state[param] = _clone_optimizer_state_value(saved_state)
 
 
 def _persist_runtime_log(run_id: str, msg: str) -> None:
@@ -847,6 +878,10 @@ def eval_val_ttt_score_first_global(
     adapted_chunk_count = 0
     total_update_steps = 0
     total_adapt_chunks = max(len(chunked_specs) - 1, 0)
+    opt_state_banks = max(args.ttt_opt_state_banks, 1)
+    banked_optimizer_states = [
+        _capture_ttt_optimizer_state(optimizer, ttt_params) for _ in range(opt_state_banks)
+    ]
     lr_first = _score_first_chunk_lr(args.ttt_lr, 0, total_adapt_chunks) if total_adapt_chunks > 0 else args.ttt_lr
     lr_last = (
         _score_first_chunk_lr(args.ttt_lr, total_adapt_chunks - 1, total_adapt_chunks)
@@ -898,6 +933,9 @@ def eval_val_ttt_score_first_global(
                 chunk_start = chunk_idx * chunk_tokens
                 chunk_end = min(total_tokens, chunk_start + chunk_tokens)
                 chunk_lr = _score_first_chunk_lr(args.ttt_lr, chunk_idx, total_adapt_chunks)
+                bank_idx = chunk_idx % opt_state_banks
+                _restore_ttt_optimizer_state(optimizer, ttt_params, banked_optimizer_states[bank_idx])
+                optimizer.zero_grad(set_to_none=True)
                 update_steps = _adapt_ttt_chunk(
                     args,
                     model,
@@ -908,6 +946,7 @@ def eval_val_ttt_score_first_global(
                     chunk_lr,
                 )
                 if update_steps > 0:
+                    banked_optimizer_states[bank_idx] = _capture_ttt_optimizer_state(optimizer, ttt_params)
                     adapted_chunk_count += 1
                     total_update_steps += update_steps
     finally:
@@ -928,6 +967,7 @@ def eval_val_ttt_score_first_global(
             f"adapted_chunks:{adapted_chunk_count} update_steps:{total_update_steps} "
             f"stride_active:1 stride:{stride} chunk_tokens:{chunk_tokens} "
             f"epochs:{max(args.ttt_epochs, 0)} momentum:{args.ttt_momentum:.3f} "
+            f"opt_state_banks:{opt_state_banks} state_carry:{'banked' if opt_state_banks > 1 else 'global'} "
             f"lr_schedule:cosine lr_first:{lr_first:.6f} lr_last:{lr_last:.6f} "
             f"elapsed_ms:{elapsed_ms:.0f}",
         )
@@ -1811,7 +1851,8 @@ def main() -> None:
     log0(
         f"ttt:enabled={args.ttt_enable} protocol:{args.ttt_protocol} prefix_tokens:{args.ttt_prefix_tokens} "
         f"scope:{args.ttt_scope} steps:{args.ttt_steps} lr:{args.ttt_lr} "
-        f"momentum:{args.ttt_momentum:.3f} epochs:{args.ttt_epochs} chunk_tokens:{args.ttt_chunk_tokens} "
+        f"momentum:{args.ttt_momentum:.3f} opt_state_banks:{max(args.ttt_opt_state_banks, 1)} "
+        f"epochs:{args.ttt_epochs} chunk_tokens:{args.ttt_chunk_tokens} "
         f"c_v_carrier_rank:{args.ttt_c_v_carrier_rank} "
         f"max_prefix_fraction:{args.ttt_max_prefix_fraction:.2f} "
         f"matched_params:{sum(int(p.numel()) for p in ttt_params)} "
