@@ -86,6 +86,9 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
+    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
+    ve_dim = int(os.environ.get("VE_DIM", 32))
+    ve_layers = os.environ.get("VE_LAYERS", "")
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -1068,7 +1071,10 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        (
+            "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,"
+            "q_gain,skip_weight,skip_weights,ve_layer_scales"
+        ),
     ).split(",")
     if pattern
 )
@@ -1351,6 +1357,24 @@ class FastWeightCarrier(nn.Module):
         return self.up(self.down(x))
 
 
+class ValueEmbedding(nn.Module):
+    # Shared token-to-value bridge, injected only into selected late attention blocks.
+    def __init__(self, vocab_size: int, ve_dim: int, output_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, ve_dim)
+        nn.init.normal_(self.embed.weight, std=0.01)
+        self.proj = CastedLinear(ve_dim, output_dim, bias=False) if ve_dim != output_dim else None
+        if self.proj is not None:
+            self.proj._zero_init = True
+        self.register_buffer("base_scale", torch.tensor(0.1, dtype=torch.float32), persistent=False)
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(token_ids)
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.base_scale.to(dtype=h.dtype)
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -1442,13 +1466,15 @@ class CausalSelfAttention(nn.Module):
         value_proj = (y_grouped * value_dir).sum(dim=-1, keepdim=True) * value_dir
         return (y_grouped - value_proj).reshape(bsz, seqlen, num_heads, head_dim)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, v_embed: Tensor | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x)
         if self.c_v_carrier is not None:
             v = v + self.c_v_carrier(x).to(dtype=v.dtype)
+        if v_embed is not None:
+            v = v + v_embed.to(dtype=v.dtype)
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
@@ -1519,10 +1545,10 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), v_embed=v_embed)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -1543,6 +1569,9 @@ class GPT(nn.Module):
         rope_base: float,
         rope_dims: int,
         xsa_last_n: int,
+        ve_enabled: bool,
+        ve_dim: int,
+        ve_layers: str,
         qk_gain_init: float,
         ttt_c_v_carrier_rank: int,
     ):
@@ -1552,6 +1581,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self._ve_target_dim = num_kv_heads * (model_dim // num_heads)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1575,6 +1605,16 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        requested_ve_layers = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
+        self.ve_layer_indices = [layer_idx for layer_idx in requested_ve_layers if 0 <= layer_idx < num_layers]
+        if self.ve_layer_indices:
+            self.ve_shared = ValueEmbedding(vocab_size, ve_dim, self._ve_target_dim)
+            self.ve_layer_scales = nn.ParameterList(
+                [nn.Parameter(torch.ones(1, dtype=torch.float32)) for _ in self.ve_layer_indices]
+            )
+        else:
+            self.ve_shared = None
+            self.ve_layer_scales = nn.ParameterList()
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1588,20 +1628,31 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict[str, Tensor]) -> Tensor | None:
+        if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
+            return None
+        if "ve" not in ve_cache:
+            ve_cache["ve"] = self.ve_shared(input_ids)
+        ve_base = ve_cache["ve"]
+        ve_idx = self.ve_layer_indices.index(layer_idx)
+        return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
+        ve_cache: dict[str, Tensor] = {}
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, v_embed=self._get_ve(i, input_ids, ve_cache))
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block_idx = self.num_encoder_layers + i
+            x = self.blocks[block_idx](x, x0, v_embed=self._get_ve(block_idx, input_ids, ve_cache))
 
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1740,6 +1791,9 @@ def main() -> None:
         rope_base=args.rope_base,
         rope_dims=args.rope_dims,
         xsa_last_n=args.xsa_last_n,
+        ve_enabled=args.ve_enabled,
+        ve_dim=args.ve_dim,
+        ve_layers=args.ve_layers,
         qk_gain_init=args.qk_gain_init,
         ttt_c_v_carrier_rank=args.ttt_c_v_carrier_rank,
     ).to(device).bfloat16()
@@ -1768,15 +1822,21 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    tok_param_groups = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
+    if base_model.ve_shared is not None:
+        scalar_params.extend(list(base_model.ve_layer_scales))
+        tok_param_groups.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
+        if base_model.ve_shared.proj is not None:
+            matrix_params.append(base_model.ve_shared.proj.weight)
     ttt_named_params = [
         (name, param)
         for name, param in base_model.named_parameters()
         if any(pattern in name for pattern in args.ttt_param_patterns)
     ]
     ttt_params = [param for _, param in ttt_named_params]
-    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        tok_param_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1828,6 +1888,11 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"xsa:last_n:{args.xsa_last_n} layers:{xsa_layers}")
+    log0(
+        f"ve:enabled={args.ve_enabled} dim:{args.ve_dim} "
+        f"requested_layers:{args.ve_layers or '-'} active_layers:{base_model.ve_layer_indices} "
+        f"shared_scale:fixed{float(base_model.ve_shared.base_scale.item()) if base_model.ve_shared is not None else 0.0:.4f}"
+    )
     log0(f"rope:base:{args.rope_base} dims:{args.rope_dims}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
