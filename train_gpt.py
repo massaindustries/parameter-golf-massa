@@ -1630,7 +1630,7 @@ class GPT(nn.Module):
         if self.ve_layer_indices:
             self.ve_shared = ValueEmbedding(vocab_size, ve_dim, self._ve_target_dim)
             self.ve_layer_scales = nn.ParameterList(
-                [nn.Parameter(torch.ones(1, dtype=torch.float32)) for _ in self.ve_layer_indices]
+                [nn.Parameter(torch.zeros(1, dtype=torch.float32)) for _ in self.ve_layer_indices]
             )
         else:
             self.ve_shared = None
@@ -1655,7 +1655,9 @@ class GPT(nn.Module):
             ve_cache["ve"] = self.ve_shared(input_ids)
         ve_base = ve_cache["ve"]
         ve_idx = self.ve_layer_indices.index(layer_idx)
-        return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+        # Keep VE updates multiplicative and positive on the tiny local-only TTT surface.
+        ve_scale = self.ve_layer_scales[ve_idx].exp().to(dtype=ve_base.dtype)
+        return ve_base * ve_scale
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1912,7 +1914,8 @@ def main() -> None:
     log0(
         f"ve:enabled={args.ve_enabled} dim:{args.ve_dim} "
         f"requested_layers:{args.ve_layers or '-'} active_layers:{base_model.ve_layer_indices} "
-        f"shared_scale:fixed{float(base_model.ve_shared.base_scale.item()) if base_model.ve_shared is not None else 0.0:.4f}"
+        f"shared_scale:fixed{float(base_model.ve_shared.base_scale.item()) if base_model.ve_shared is not None else 0.0:.4f} "
+        "scale_mode:log_exp"
     )
     log0(f"rope:base:{args.rope_base} dims:{args.rope_dims}")
     log0(
