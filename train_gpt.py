@@ -1632,9 +1632,13 @@ class GPT(nn.Module):
             self.ve_layer_scales = nn.ParameterList(
                 [nn.Parameter(torch.ones(1, dtype=torch.float32)) for _ in self.ve_layer_indices]
             )
+            self.ve_layer_update_gains = nn.ParameterList(
+                [nn.Parameter(torch.zeros(1, dtype=torch.float32)) for _ in self.ve_layer_indices]
+            )
         else:
             self.ve_shared = None
             self.ve_layer_scales = nn.ParameterList()
+            self.ve_layer_update_gains = nn.ParameterList()
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1655,7 +1659,11 @@ class GPT(nn.Module):
             ve_cache["ve"] = self.ve_shared(input_ids)
         ve_base = ve_cache["ve"]
         ve_idx = self.ve_layer_indices.index(layer_idx)
-        return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+        ve_scale = self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+        # Learn how strongly future TTT updates on the tiny VE-local surface should matter.
+        update_gain = (0.25 + 1.5 * torch.sigmoid(self.ve_layer_update_gains[ve_idx])).to(dtype=ve_base.dtype)
+        ve_scale = 1.0 + (ve_scale - 1.0) * update_gain
+        return ve_base * ve_scale
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1846,6 +1854,7 @@ def main() -> None:
     tok_param_groups = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.ve_shared is not None:
         scalar_params.extend(list(base_model.ve_layer_scales))
+        scalar_params.extend(list(base_model.ve_layer_update_gains))
         tok_param_groups.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.ve_shared.proj is not None:
             matrix_params.append(base_model.ve_shared.proj.weight)
@@ -1912,7 +1921,8 @@ def main() -> None:
     log0(
         f"ve:enabled={args.ve_enabled} dim:{args.ve_dim} "
         f"requested_layers:{args.ve_layers or '-'} active_layers:{base_model.ve_layer_indices} "
-        f"shared_scale:fixed{float(base_model.ve_shared.base_scale.item()) if base_model.ve_shared is not None else 0.0:.4f}"
+        f"shared_scale:fixed{float(base_model.ve_shared.base_scale.item()) if base_model.ve_shared is not None else 0.0:.4f} "
+        "update_gain_mode:bounded_sigmoid update_gain_bounds:0.25..1.75"
     )
     log0(f"rope:base:{args.rope_base} dims:{args.rope_dims}")
     log0(
@@ -2097,6 +2107,12 @@ def main() -> None:
         current_state = base_model.state_dict()
         avg_state = {name: tensor.to(dtype=current_state[name].dtype) for name, tensor in ema_state.items()}
         base_model.load_state_dict(avg_state, strict=True)
+    if base_model.ve_shared is not None:
+        ve_update_gains = ",".join(
+            f"{(0.25 + 1.5 * torch.sigmoid(param.detach())).item():.4f}"
+            for param in base_model.ve_layer_update_gains
+        )
+        log0(f"ve:update_gains_final:{ve_update_gains or '-'}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
