@@ -90,6 +90,10 @@ class Hyperparameters:
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
     ve_dim = int(os.environ.get("VE_DIM", 32))
     ve_layers = os.environ.get("VE_LAYERS", "")
+    blm_enabled = bool(int(os.environ.get("BLM_ENABLED", "0")))
+    blm_banks = int(os.environ.get("BLM_BANKS", 4))
+    blm_rank = int(os.environ.get("BLM_RANK", 4))
+    blm_layers = os.environ.get("BLM_LAYERS", "")
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -1098,6 +1102,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+ADAM_BLOCK_PARAM_NAME_PATTERNS = ("bank_local_matrix",)
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
@@ -1377,6 +1382,30 @@ class FastWeightCarrier(nn.Module):
         return self.up(self.down(x))
 
 
+class BankLocalMatrix(nn.Module):
+    # Tiny bank-local low-rank lane used as a richer dedicated TTT write surface.
+    def __init__(self, dim: int, num_banks: int, rank: int):
+        super().__init__()
+        if num_banks <= 0:
+            raise ValueError("BLM_BANKS must be positive when BLM is enabled")
+        if rank <= 0:
+            raise ValueError("BLM_RANK must be positive when BLM is enabled")
+        if dim % num_banks != 0:
+            raise ValueError(f"model_dim={dim} must be divisible by BLM_BANKS={num_banks}")
+        self.num_banks = num_banks
+        self.bank_dim = dim // num_banks
+        self.rank = rank
+        self.down = nn.Parameter(torch.empty(num_banks, self.bank_dim, rank, dtype=torch.float32))
+        self.up = nn.Parameter(torch.zeros(num_banks, rank, self.bank_dim, dtype=torch.float32))
+        nn.init.normal_(self.down, std=0.02)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x_banks = x.reshape(*x.shape[:-1], self.num_banks, self.bank_dim)
+        hidden = torch.einsum("...bd,bdr->...br", x_banks, self.down.to(dtype=x.dtype))
+        out = torch.einsum("...br,brd->...bd", hidden, self.up.to(dtype=x.dtype))
+        return out.reshape(*x.shape[:-1], self.num_banks * self.bank_dim)
+
+
 class ValueEmbedding(nn.Module):
     # Shared token-to-value bridge, injected only into selected late attention blocks.
     def __init__(self, vocab_size: int, ve_dim: int, output_dim: int):
@@ -1399,7 +1428,11 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
-            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+            if (
+                param.ndim < 2
+                or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+                or any(pattern in name for pattern in ADAM_BLOCK_PARAM_NAME_PATTERNS)
+            ) and param.dtype != torch.float32:
                 param.data = param.data.float()
 
 
@@ -1547,6 +1580,8 @@ class Block(nn.Module):
         rope_dims: int,
         qk_gain_init: float,
         c_v_carrier_rank: int,
+        blm_banks: int,
+        blm_rank: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1560,6 +1595,9 @@ class Block(nn.Module):
             qk_gain_init,
             c_v_carrier_rank,
         )
+        self.bank_local_matrix = (
+            BankLocalMatrix(dim, blm_banks, blm_rank) if blm_banks > 0 and blm_rank > 0 else None
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1568,7 +1606,10 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x), v_embed=v_embed)
+        attn_in = self.attn_norm(x)
+        attn_out = self.attn(attn_in, v_embed=v_embed)
+        if self.bank_local_matrix is not None:
+            attn_out = attn_out + self.bank_local_matrix(attn_in).to(dtype=attn_out.dtype)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -1592,6 +1633,10 @@ class GPT(nn.Module):
         ve_enabled: bool,
         ve_dim: int,
         ve_layers: str,
+        blm_enabled: bool,
+        blm_banks: int,
+        blm_rank: int,
+        blm_layers: str,
         qk_gain_init: float,
         ttt_c_v_carrier_rank: int,
     ):
@@ -1607,6 +1652,9 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        requested_blm_layers = [int(x) for x in blm_layers.split(",") if x.strip()] if blm_enabled else []
+        self.blm_layer_indices = [layer_idx for layer_idx in requested_blm_layers if 0 <= layer_idx < num_layers]
+        blm_layer_set = set(self.blm_layer_indices)
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -1618,6 +1666,8 @@ class GPT(nn.Module):
                     rope_dims,
                     qk_gain_init,
                     ttt_c_v_carrier_rank if i == num_layers - 1 else 0,
+                    blm_banks if i in blm_layer_set else 0,
+                    blm_rank if i in blm_layer_set else 0,
                 )
                 for i in range(num_layers)
             ]
@@ -1814,6 +1864,10 @@ def main() -> None:
         ve_enabled=args.ve_enabled,
         ve_dim=args.ve_dim,
         ve_layers=args.ve_layers,
+        blm_enabled=args.blm_enabled,
+        blm_banks=args.blm_banks,
+        blm_rank=args.blm_rank,
+        blm_layers=args.blm_layers,
         qk_gain_init=args.qk_gain_init,
         ttt_c_v_carrier_rank=args.ttt_c_v_carrier_rank,
     ).to(device).bfloat16()
@@ -1833,12 +1887,16 @@ def main() -> None:
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2
+        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        and not any(pattern in name for pattern in ADAM_BLOCK_PARAM_NAME_PATTERNS)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2
+        or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        or any(pattern in name for pattern in ADAM_BLOCK_PARAM_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1913,6 +1971,10 @@ def main() -> None:
         f"ve:enabled={args.ve_enabled} dim:{args.ve_dim} "
         f"requested_layers:{args.ve_layers or '-'} active_layers:{base_model.ve_layer_indices} "
         f"shared_scale:fixed{float(base_model.ve_shared.base_scale.item()) if base_model.ve_shared is not None else 0.0:.4f}"
+    )
+    log0(
+        f"blm:enabled={args.blm_enabled} banks:{args.blm_banks} rank:{args.blm_rank} "
+        f"requested_layers:{args.blm_layers or '-'} active_layers:{base_model.blm_layer_indices}"
     )
     log0(f"rope:base:{args.rope_base} dims:{args.rope_dims}")
     log0(
