@@ -90,6 +90,9 @@ class Hyperparameters:
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
     ve_dim = int(os.environ.get("VE_DIM", 32))
     ve_layers = os.environ.get("VE_LAYERS", "")
+    lanemix_enabled = bool(int(os.environ.get("LANEMIX_ENABLED", "0")))
+    lanemix_layers = os.environ.get("LANEMIX_LAYERS", "")
+    lanemix_init_gain = float(os.environ.get("LANEMIX_INIT_GAIN", "0.0"))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -1093,7 +1096,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
         "CONTROL_TENSOR_NAME_PATTERNS",
         (
             "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,"
-            "q_gain,skip_weight,skip_weights,ve_layer_scales"
+            "q_gain,skip_weight,skip_weights,ve_layer_scales,lane_mix"
         ),
     ).split(",")
     if pattern
@@ -1547,6 +1550,8 @@ class Block(nn.Module):
         rope_dims: int,
         qk_gain_init: float,
         c_v_carrier_rank: int,
+        lane_mix_active: bool,
+        lane_mix_init_gain: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1564,14 +1569,27 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.lane_mix_logits = (
+            nn.Parameter(torch.zeros(2, dtype=torch.float32)) if lane_mix_active else None
+        )
+        self.lane_mix_gain = (
+            nn.Parameter(torch.tensor(lane_mix_init_gain, dtype=torch.float32)) if lane_mix_active else None
+        )
 
     def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x), v_embed=v_embed)
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        attn_branch = self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        if self.lane_mix_logits is None or self.lane_mix_gain is None:
+            x = x + attn_branch
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            return x
+        mlp_branch = self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + attn_branch + mlp_branch
+        lane_weights = torch.softmax(self.lane_mix_logits, dim=0).to(dtype=x.dtype)
+        lane_branch = lane_weights[0] * attn_branch + lane_weights[1] * mlp_branch
+        return x + self.lane_mix_gain.to(dtype=x.dtype) * lane_branch
 
 
 class GPT(nn.Module):
@@ -1592,6 +1610,9 @@ class GPT(nn.Module):
         ve_enabled: bool,
         ve_dim: int,
         ve_layers: str,
+        lanemix_enabled: bool,
+        lanemix_layers: str,
+        lanemix_init_gain: float,
         qk_gain_init: float,
         ttt_c_v_carrier_rank: int,
     ):
@@ -1602,6 +1623,9 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)
+        requested_lane_mix_layers = [int(x) for x in lanemix_layers.split(",") if x.strip()] if lanemix_enabled else []
+        self.lane_mix_layer_indices = [layer_idx for layer_idx in requested_lane_mix_layers if 0 <= layer_idx < num_layers]
+        lane_mix_layers = set(self.lane_mix_layer_indices)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1618,6 +1642,8 @@ class GPT(nn.Module):
                     rope_dims,
                     qk_gain_init,
                     ttt_c_v_carrier_rank if i == num_layers - 1 else 0,
+                    i in lane_mix_layers,
+                    lanemix_init_gain,
                 )
                 for i in range(num_layers)
             ]
@@ -1656,6 +1682,21 @@ class GPT(nn.Module):
         ve_base = ve_cache["ve"]
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+
+    def lane_mix_summary(self) -> str:
+        if not self.lane_mix_layer_indices:
+            return "active_layers:[] summary:-"
+        layer_summaries = []
+        for layer_idx in self.lane_mix_layer_indices:
+            block = self.blocks[layer_idx]
+            if block.lane_mix_logits is None or block.lane_mix_gain is None:
+                continue
+            weights = torch.softmax(block.lane_mix_logits.detach().float().cpu(), dim=0).tolist()
+            layer_summaries.append(
+                f"{layer_idx}:weights={weights[0]:.4f},{weights[1]:.4f}|gain={float(block.lane_mix_gain.item()):.4f}"
+            )
+        summary = ";".join(layer_summaries) if layer_summaries else "-"
+        return f"active_layers:{self.lane_mix_layer_indices} summary:{summary}"
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1814,6 +1855,9 @@ def main() -> None:
         ve_enabled=args.ve_enabled,
         ve_dim=args.ve_dim,
         ve_layers=args.ve_layers,
+        lanemix_enabled=args.lanemix_enabled,
+        lanemix_layers=args.lanemix_layers,
+        lanemix_init_gain=args.lanemix_init_gain,
         qk_gain_init=args.qk_gain_init,
         ttt_c_v_carrier_rank=args.ttt_c_v_carrier_rank,
     ).to(device).bfloat16()
@@ -1913,6 +1957,10 @@ def main() -> None:
         f"ve:enabled={args.ve_enabled} dim:{args.ve_dim} "
         f"requested_layers:{args.ve_layers or '-'} active_layers:{base_model.ve_layer_indices} "
         f"shared_scale:fixed{float(base_model.ve_shared.base_scale.item()) if base_model.ve_shared is not None else 0.0:.4f}"
+    )
+    log0(
+        f"lanemix:enabled={args.lanemix_enabled} requested_layers:{args.lanemix_layers or '-'} "
+        f"init_gain:{args.lanemix_init_gain:.4f} {base_model.lane_mix_summary()}"
     )
     log0(f"rope:base:{args.rope_base} dims:{args.rope_dims}")
     log0(
@@ -2097,6 +2145,7 @@ def main() -> None:
         current_state = base_model.state_dict()
         avg_state = {name: tensor.to(dtype=current_state[name].dtype) for name, tensor in ema_state.items()}
         base_model.load_state_dict(avg_state, strict=True)
+    log0(f"lanemix:final {base_model.lane_mix_summary()}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
