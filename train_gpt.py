@@ -75,6 +75,10 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_bridge_enabled = bool(int(os.environ.get("QK_BRIDGE_ENABLED", "0")))
+    qk_bridge_layers = os.environ.get("QK_BRIDGE_LAYERS", "")
+    qk_bridge_target = float(os.environ.get("QK_BRIDGE_TARGET", "5.25"))
+    qk_bridge_init = float(os.environ.get("QK_BRIDGE_INIT", "0.0"))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -1457,6 +1461,9 @@ class CausalSelfAttention(nn.Module):
         rope_base: float,
         rope_dims: int,
         qk_gain_init: float,
+        qk_bridge_active: bool,
+        qk_bridge_target: float,
+        qk_bridge_init: float,
         c_v_carrier_rank: int,
     ):
         super().__init__()
@@ -1480,6 +1487,10 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.q_gain_bridge_logit = (
+            nn.Parameter(torch.tensor(qk_bridge_init, dtype=torch.float32)) if qk_bridge_active else None
+        )
+        self.q_gain_bridge_target = qk_bridge_target
         self.rotary = Rotary(self.rope_dims, base=rope_base)
         self.use_xsa = False
 
@@ -1511,7 +1522,11 @@ class CausalSelfAttention(nn.Module):
         else:
             q = torch.cat((apply_rotary_emb(q[..., : self.rope_dims], cos, sin), q[..., self.rope_dims :]), dim=-1)
             k = torch.cat((apply_rotary_emb(k[..., : self.rope_dims], cos, sin), k[..., self.rope_dims :]), dim=-1)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q_gain = self.q_gain.to(dtype=q.dtype)
+        if self.q_gain_bridge_logit is not None:
+            mix = torch.sigmoid(self.q_gain_bridge_logit).to(dtype=q.dtype)
+            q_gain = torch.lerp(q_gain, torch.full_like(q_gain, self.q_gain_bridge_target), mix)
+        q = q * q_gain[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -1552,6 +1567,9 @@ class Block(nn.Module):
         rope_base: float,
         rope_dims: int,
         qk_gain_init: float,
+        qk_bridge_active: bool,
+        qk_bridge_target: float,
+        qk_bridge_init: float,
         c_v_carrier_rank: int,
         lane_mix_active: bool,
         lane_mix_init_gain: float,
@@ -1568,6 +1586,9 @@ class Block(nn.Module):
             rope_base,
             rope_dims,
             qk_gain_init,
+            qk_bridge_active,
+            qk_bridge_target,
+            qk_bridge_init,
             c_v_carrier_rank,
         )
         self.mlp = MLP(dim, mlp_mult)
@@ -1637,6 +1658,10 @@ class GPT(nn.Module):
         recur_layers: str,
         recur_init_gain: float,
         qk_gain_init: float,
+        qk_bridge_enabled: bool,
+        qk_bridge_layers: str,
+        qk_bridge_target: float,
+        qk_bridge_init: float,
         ttt_c_v_carrier_rank: int,
     ):
         super().__init__()
@@ -1646,6 +1671,11 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)
+        requested_q_gain_bridge_layers = [int(x) for x in qk_bridge_layers.split(",") if x.strip()] if qk_bridge_enabled else []
+        self.q_gain_bridge_layer_indices = [
+            layer_idx for layer_idx in requested_q_gain_bridge_layers if 0 <= layer_idx < num_layers
+        ]
+        q_gain_bridge_layers = set(self.q_gain_bridge_layer_indices)
         requested_lane_mix_layers = [int(x) for x in lanemix_layers.split(",") if x.strip()] if lanemix_enabled else []
         self.lane_mix_layer_indices = [layer_idx for layer_idx in requested_lane_mix_layers if 0 <= layer_idx < num_layers]
         lane_mix_layers = set(self.lane_mix_layer_indices)
@@ -1667,6 +1697,9 @@ class GPT(nn.Module):
                     rope_base,
                     rope_dims,
                     qk_gain_init,
+                    i in q_gain_bridge_layers,
+                    qk_bridge_target,
+                    qk_bridge_init,
                     ttt_c_v_carrier_rank if i == num_layers - 1 else 0,
                     i in lane_mix_layers,
                     lanemix_init_gain,
@@ -1725,6 +1758,25 @@ class GPT(nn.Module):
             )
         summary = ";".join(layer_summaries) if layer_summaries else "-"
         return f"active_layers:{self.lane_mix_layer_indices} summary:{summary}"
+
+    def q_gain_bridge_summary(self) -> str:
+        if not self.q_gain_bridge_layer_indices:
+            return "active_layers:[] summary:-"
+        layer_summaries = []
+        for layer_idx in self.q_gain_bridge_layer_indices:
+            attn = self.blocks[layer_idx].attn
+            if attn.q_gain_bridge_logit is None:
+                continue
+            base = attn.q_gain.detach().float().cpu()
+            mix = float(torch.sigmoid(attn.q_gain_bridge_logit.detach().float()).item())
+            effective = torch.lerp(base, torch.full_like(base, attn.q_gain_bridge_target), mix)
+            layer_summaries.append(
+                f"{layer_idx}:mix={mix:.4f}|base_mean={float(base.mean().item()):.4f}|"
+                f"eff_mean={float(effective.mean().item()):.4f}|"
+                f"eff_min={float(effective.min().item()):.4f}|eff_max={float(effective.max().item()):.4f}"
+            )
+        summary = ";".join(layer_summaries) if layer_summaries else "-"
+        return f"active_layers:{self.q_gain_bridge_layer_indices} summary:{summary}"
 
     def recur_summary(self) -> str:
         if not self.recur_layer_indices:
@@ -1907,6 +1959,10 @@ def main() -> None:
         recur_layers=args.recur_layers,
         recur_init_gain=args.recur_init_gain,
         qk_gain_init=args.qk_gain_init,
+        qk_bridge_enabled=args.qk_bridge_enabled,
+        qk_bridge_layers=args.qk_bridge_layers,
+        qk_bridge_target=args.qk_bridge_target,
+        qk_bridge_init=args.qk_bridge_init,
         ttt_c_v_carrier_rank=args.ttt_c_v_carrier_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -2005,6 +2061,10 @@ def main() -> None:
         f"ve:enabled={args.ve_enabled} dim:{args.ve_dim} "
         f"requested_layers:{args.ve_layers or '-'} active_layers:{base_model.ve_layer_indices} "
         f"shared_scale:fixed{float(base_model.ve_shared.base_scale.item()) if base_model.ve_shared is not None else 0.0:.4f}"
+    )
+    log0(
+        f"qgain_bridge:enabled={args.qk_bridge_enabled} requested_layers:{args.qk_bridge_layers or '-'} "
+        f"target:{args.qk_bridge_target:.4f} init:{args.qk_bridge_init:.4f} {base_model.q_gain_bridge_summary()}"
     )
     log0(
         f"lanemix:enabled={args.lanemix_enabled} requested_layers:{args.lanemix_layers or '-'} "
@@ -2197,6 +2257,7 @@ def main() -> None:
         current_state = base_model.state_dict()
         avg_state = {name: tensor.to(dtype=current_state[name].dtype) for name, tensor in ema_state.items()}
         base_model.load_state_dict(avg_state, strict=True)
+    log0(f"qgain_bridge:final {base_model.q_gain_bridge_summary()}")
     log0(f"lanemix:final {base_model.lane_mix_summary()}")
     log0(f"recur:final {base_model.recur_summary()}")
 
