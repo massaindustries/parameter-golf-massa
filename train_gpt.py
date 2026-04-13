@@ -93,6 +93,9 @@ class Hyperparameters:
     lanemix_enabled = bool(int(os.environ.get("LANEMIX_ENABLED", "0")))
     lanemix_layers = os.environ.get("LANEMIX_LAYERS", "")
     lanemix_init_gain = float(os.environ.get("LANEMIX_INIT_GAIN", "0.0"))
+    recur_enabled = bool(int(os.environ.get("RECUR_ENABLED", "0")))
+    recur_layers = os.environ.get("RECUR_LAYERS", "")
+    recur_init_gain = float(os.environ.get("RECUR_INIT_GAIN", "0.05"))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -1096,7 +1099,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
         "CONTROL_TENSOR_NAME_PATTERNS",
         (
             "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,"
-            "q_gain,skip_weight,skip_weights,ve_layer_scales,lane_mix"
+            "q_gain,skip_weight,skip_weights,ve_layer_scales,lane_mix,recur_scale,recur_gain"
         ),
     ).split(",")
     if pattern
@@ -1552,6 +1555,8 @@ class Block(nn.Module):
         c_v_carrier_rank: int,
         lane_mix_active: bool,
         lane_mix_init_gain: float,
+        recur_active: bool,
+        recur_init_gain: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1575,21 +1580,36 @@ class Block(nn.Module):
         self.lane_mix_gain = (
             nn.Parameter(torch.tensor(lane_mix_init_gain, dtype=torch.float32)) if lane_mix_active else None
         )
+        self.recur_scale = (
+            nn.Parameter(torch.zeros(dim, dtype=torch.float32)) if recur_active else None
+        )
+        self.recur_gain = (
+            nn.Parameter(torch.tensor(recur_init_gain, dtype=torch.float32)) if recur_active else None
+        )
 
-    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    def _forward_once(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None, *, apply_resid_mix: bool) -> Tensor:
+        if apply_resid_mix:
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x), v_embed=v_embed)
         attn_branch = self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         if self.lane_mix_logits is None or self.lane_mix_gain is None:
             x = x + attn_branch
-            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-            return x
+            return x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         mlp_branch = self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         x = x + attn_branch + mlp_branch
         lane_weights = torch.softmax(self.lane_mix_logits, dim=0).to(dtype=x.dtype)
         lane_branch = lane_weights[0] * attn_branch + lane_weights[1] * mlp_branch
         return x + self.lane_mix_gain.to(dtype=x.dtype) * lane_branch
+
+    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
+        x = self._forward_once(x, x0, v_embed=v_embed, apply_resid_mix=True)
+        if self.recur_scale is None or self.recur_gain is None:
+            return x
+        recur_scale = torch.tanh(self.recur_scale).to(dtype=x.dtype)[None, None, :]
+        recur_out = self._forward_once(x, x0, v_embed=v_embed, apply_resid_mix=False)
+        recur_delta = recur_out - x
+        return x + self.recur_gain.to(dtype=x.dtype) * recur_scale * recur_delta
 
 
 class GPT(nn.Module):
@@ -1613,6 +1633,9 @@ class GPT(nn.Module):
         lanemix_enabled: bool,
         lanemix_layers: str,
         lanemix_init_gain: float,
+        recur_enabled: bool,
+        recur_layers: str,
+        recur_init_gain: float,
         qk_gain_init: float,
         ttt_c_v_carrier_rank: int,
     ):
@@ -1626,6 +1649,9 @@ class GPT(nn.Module):
         requested_lane_mix_layers = [int(x) for x in lanemix_layers.split(",") if x.strip()] if lanemix_enabled else []
         self.lane_mix_layer_indices = [layer_idx for layer_idx in requested_lane_mix_layers if 0 <= layer_idx < num_layers]
         lane_mix_layers = set(self.lane_mix_layer_indices)
+        requested_recur_layers = [int(x) for x in recur_layers.split(",") if x.strip()] if recur_enabled else []
+        self.recur_layer_indices = [layer_idx for layer_idx in requested_recur_layers if 0 <= layer_idx < num_layers]
+        recur_layer_set = set(self.recur_layer_indices)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1644,6 +1670,8 @@ class GPT(nn.Module):
                     ttt_c_v_carrier_rank if i == num_layers - 1 else 0,
                     i in lane_mix_layers,
                     lanemix_init_gain,
+                    i in recur_layer_set,
+                    recur_init_gain,
                 )
                 for i in range(num_layers)
             ]
@@ -1697,6 +1725,23 @@ class GPT(nn.Module):
             )
         summary = ";".join(layer_summaries) if layer_summaries else "-"
         return f"active_layers:{self.lane_mix_layer_indices} summary:{summary}"
+
+    def recur_summary(self) -> str:
+        if not self.recur_layer_indices:
+            return "active_layers:[] summary:-"
+        layer_summaries = []
+        for layer_idx in self.recur_layer_indices:
+            block = self.blocks[layer_idx]
+            if block.recur_scale is None or block.recur_gain is None:
+                continue
+            recur_scale = torch.tanh(block.recur_scale.detach().float().cpu())
+            layer_summaries.append(
+                f"{layer_idx}:mean_abs={float(recur_scale.abs().mean().item()):.4f}|"
+                f"max_abs={float(recur_scale.abs().max().item()):.4f}|"
+                f"gain={float(block.recur_gain.item()):.4f}"
+            )
+        summary = ";".join(layer_summaries) if layer_summaries else "-"
+        return f"active_layers:{self.recur_layer_indices} summary:{summary}"
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1858,6 +1903,9 @@ def main() -> None:
         lanemix_enabled=args.lanemix_enabled,
         lanemix_layers=args.lanemix_layers,
         lanemix_init_gain=args.lanemix_init_gain,
+        recur_enabled=args.recur_enabled,
+        recur_layers=args.recur_layers,
+        recur_init_gain=args.recur_init_gain,
         qk_gain_init=args.qk_gain_init,
         ttt_c_v_carrier_rank=args.ttt_c_v_carrier_rank,
     ).to(device).bfloat16()
@@ -1961,6 +2009,10 @@ def main() -> None:
     log0(
         f"lanemix:enabled={args.lanemix_enabled} requested_layers:{args.lanemix_layers or '-'} "
         f"init_gain:{args.lanemix_init_gain:.4f} {base_model.lane_mix_summary()}"
+    )
+    log0(
+        f"recur:enabled={args.recur_enabled} requested_layers:{args.recur_layers or '-'} "
+        f"init_gain:{args.recur_init_gain:.4f} {base_model.recur_summary()}"
     )
     log0(f"rope:base:{args.rope_base} dims:{args.rope_dims}")
     log0(
@@ -2146,6 +2198,7 @@ def main() -> None:
         avg_state = {name: tensor.to(dtype=current_state[name].dtype) for name, tensor in ema_state.items()}
         base_model.load_state_dict(avg_state, strict=True)
     log0(f"lanemix:final {base_model.lane_mix_summary()}")
+    log0(f"recur:final {base_model.recur_summary()}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
