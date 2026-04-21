@@ -1,0 +1,18 @@
+{
+  "best_valid_bpb": 1.18390334,
+  "best_valid_branch": "autoresearch/mar25",
+  "best_valid_run": "mar25_r08_eval_stride64",
+  "completed": [
+    "mar25_r01_baseline",
+    "mar25_r02_ttt_doc_s1",
+    "mar25_r03_ttt_seq_s1",
+    "mar25_r04_ttt_doc_s2",
+    "mar25_r05_ttt_doc_lr003",
+    "mar25_r06_ttt_doc_lr03",
+    "mar25_r07_ttt_doc_extpatterns",
+    "mar25_r08_eval_stride64",
+    "mar25_r09_ema",
+    "mar25_r10_clip99999"
+  ],
+  "phase": "mandatory"
+}

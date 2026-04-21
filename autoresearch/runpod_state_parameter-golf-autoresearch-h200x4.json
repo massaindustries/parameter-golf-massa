@@ -1,0 +1,8 @@
+{
+  "last_failure_at": "2026-03-27T06:56:47.008097+00:00",
+  "last_failure_reason": "runpodctl pod start de5lnontqqs4x2 failed after 3 attempts: {\"error\":\"api error: {\\\"error\\\":\\\"start pod: There are not enough free GPUs on the host machine to start this pod.\\\",\\\"status\\\":500}\\n (status 500)\"}\nUsage:\n  runpodctl pod start <pod-id> [flags]\n\nFlags:\n  -h, --help   help for start\n\nGlobal Flags:\n  -o, --output string   output format (json, yaml) (default \"json\")\n\n{\"error\":\"failed to start pod: api error: {\"error\":\"start pod: There are not enough free GPUs on the host machine to start this pod.\",\"status\":500}\n (status 500)\"}",
+  "last_success_at": "2026-03-27T00:37:27.418520+00:00",
+  "pod_id": "de5lnontqqs4x2",
+  "pod_name": "parameter-golf-autoresearch-h200x4",
+  "unhealthy_until": "2026-03-27T09:56:47.008072+00:00"
+}

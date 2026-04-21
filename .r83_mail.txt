@@ -1,0 +1,16 @@
+Run: apr11_r83_xsa_last9_ve12_l8_logscale_epochs1_clip1
+Backend: Seeweb
+Branch: candidate/mar27/ve-logscale-l8-d12 @ 69e8be8
+Status: discard
+Result: 2.10794132 bpb
+Artifact size: 15975850 bytes
+Pre-quant bpb: 2.0941
+TTT activity: scale_mode=log_exp matched_params=1 adapted_chunks=1892 update_steps=968704 stride_active=1 delta_budget_ratio=0.100
+Promoted codebase changed: no
+
+Real legal adaptation happened, but the final post-quant metric lands +0.93460348 vs r82 and +0.93484182 vs the promoted best, so the exact log-param VE env-only adapting line is closed.
+
+Next proposals:
+- Add a learned update-scale or clamp parameter on the same VE-local surface instead of another env-only rerun.
+- Prototype a tiny bank-local adaptive matrix in the deepest block so the update surface is still low-byte but no longer one scalar.
+- If the VE path stays unstable, pivot to another materially different low-byte adaptive surface rather than reopening carrier or exact local-only VE lines.

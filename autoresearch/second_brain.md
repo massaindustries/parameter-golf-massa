@@ -1,0 +1,25 @@
+# Second Brain
+- best_global: promoted `r91` recurrence-gate anchor on `41cc8a3` (`autoresearch/mar27`) | 1.17002954 bpb | 15986864 bytes
+- headroom: 13136 bytes at promoted best `r91`
+- implementation: promoted code now stacks VE/XSA + late `lane_mix`/`q_gain` routing with a dedicated block-8 recurrence gate surface
+- evidence: `r91` promote | 1.17002954 | 15986864 bytes | matched_params 513 | adapted_chunks 0 | update_steps 0 | prequant 1.1635
+- evidence: `r91` recur final | mean_abs 0.6335 | max_abs 1.0000 | gain 2.0749
+- evidence: `r91` lane-mix final | weights 0.8784/0.1216 | gain 25.5974
+- evidence: `r92` discard | 2.10705140 | 15990957 bytes | matched_params 513 | adapted_chunks 1892 | update_steps 968704 | prequant 2.0911
+- evidence: `r92` recur final | mean_abs 0.6389 | max_abs 1.0000 | gain 1.8943
+- evidence: `r94` invalid anchor 1.17182780 @16001342 vs `r95` valid anchor 1.17298435 @15994452 | matched_params 73 | adapted_chunks 0 | update_steps 0 | prequant 1.1645/1.1649
+- evidence: `r95` qgain final | mix 0.8242 | base_mean 2.7534 | eff_mean 4.3990 | headroom 5548
+- broken_family: existing-control adapting surfaces are closed (`r63`, `r65`, `r67`)
+- broken_family: carrier adapting rewrites are closed (`r69`, `r71`, `r72`, `r74`) and state-banked carry already fails the no-update gate (`r75`)
+- broken_family: scalar-only VE adapting lines are closed (`r77`, `r79`, `r81`, `r83`, `r85` all land about +0.92..+0.96 bpb vs anchors)
+- broken_family: exact bank-local matrix adapting line is closed (`r87` lands +0.87967049 vs `r86` with matched_params 4096)
+- broken_family: exact plain-SGD `lane_mix` adapting line is closed (`r89` lands +0.92470707 vs `r88` despite real adaptation)
+- broken_family: exact plain-SGD recurrence adapting line is closed (`r92` lands +0.93702186 vs `r91` despite real adaptation)
+- rule: no carrier, scalar-only VE, exact BLM, exact `lane_mix`, or exact `recur` env-only reruns without a material code change
+- rule: exact broad `q_gain` anchor at target `5.25` is closed; only interpolated init/target variants or narrower write surfaces stay open
+- archive: `candidate/mar27/tiny-bank-local-matrix-l8`, `candidate/mar27/ve-logscale-l8-d12`, `candidate/mar27/ve-learned-updategain-l8-d12`, and `candidate/mar27/qk-gain-bridge-l8` stay archived
+- competitor: official board checked Apr 13 2026 still shows `2026-04-13_SP8192_3-Layer Recurrence + Parallel Residuals + Legal TTT` at 1.0810
+- local_gap: promoted `r91` is about +0.0890 bpb behind the public leader
+- review: Apr 16 tighter `q_gain` target `4.75` reopens validity and saves 6890 bytes vs `r94`, but loses 0.00115655 bpb vs `r94` and 0.00078862 vs `r93`
+- next: spend at most one interpolation anchor on broad `q_gain` (`target≈5.0` and/or colder init) before any adapting claim
+- next: if interpolation still misses `r94` badly, pivot to a narrower `q_gain` write surface or back to a cheaper recurrence/routing bridge

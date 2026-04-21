@@ -1,0 +1,205 @@
+Parameter Golf Autoresearch Status Report
+Date: 2026-04-02 UTC
+Repo: /root/fmassapg
+
+1. Executive Summary
+
+The autoresearch loop is functioning operationally: experiments are being launched, logged, recorded in results.tsv, and emailed. The current bottleneck is not orchestration but research quality. The strongest progress so far has come from substrate/model/evaluation improvements, not from true self-learning. The best promoted result is currently:
+
+- 1.17712638 val_bpb
+- 15,932,190 bytes
+- commit: 3a4ce09
+
+This best score came from a score-first / TTT-aware harness with a tiny c_v carrier, but critically with TTT_EPOCHS=0, meaning no real online adaptation happened. In other words, the best result so far is still effectively a static model/eval improvement, not a successful self-learning result.
+
+2. Best Improvement Path So Far
+
+The successful sequence of improvements has been:
+
+- baseline full rerun: 1.21803700
+- EVAL_STRIDE=64: 1.18390334
+- MLP_ACT=LeakyReLU(0.5)^2: 1.18115800
+- ROPE_DIMS=16: 1.17997170
+- EMA_ENABLED=1: 1.17921743
+- WARMDOWN_ITERS=2000: 1.17874483
+- WARMDOWN_ITERS=3500: 1.17814907
+- score-first harness + c_v carrier, but no updates (TTT_EPOCHS=0): 1.17712638
+
+Interpretation:
+
+- Sliding evaluation was the major early breakthrough.
+- Subsequent gains were small but real and cumulative.
+- The strongest gains after that came from training/eval/architecture refinements:
+  activation choice, partial RoPE, EMA, and longer warmdown.
+- The c_v carrier branch helped only as a better substrate/harness; no evidence yet that online weight updates improved quality.
+
+3. Self-Learning / TTT Status
+
+Overall verdict: real self-learning is not working yet.
+
+Counts from results.tsv:
+
+- total logged experiments: 43
+- self-learning / TTT-related experiments: 29
+- TTT-related keeps: 1
+- but that single keep is the no-update anchor with TTT_EPOCHS=0
+
+So the current TTT line has produced:
+
+- many runs where adaptation clearly activates
+- zero runs where adaptation with real updates beats the current static baseline
+
+4. What Has Been Tried On The Self-Learning Side
+
+4.1 Prefix/document/sequence TTT
+
+Initial TTT runs on the baseline were all strongly negative:
+
+- document-scope TTT: ~1.706 to 1.708
+- sequence-scope TTT: ~1.837
+- wider matched parameter patterns: ~1.712
+
+Interpretation:
+
+- Online adaptation was not beneficial in the original setup.
+- The failure is not marginal; the gap versus the best static branch is extremely large.
+
+4.2 LoRA-style TTT
+
+LoRA-style document TTT also failed badly:
+
+- rank 8, chunk 64: 1.72277661
+- rank 8, chunk 256: 1.77722979
+- rank 1, chunk 256: 1.81628458
+
+Interpretation:
+
+- The model can execute the adaptation path, but LoRA-style eval-time updates are strongly destructive in this codebase/configuration.
+- Increasing chunk size or reducing rank did not rescue the idea.
+
+4.3 Score-first chunked / global TTT
+
+The score-first branch showed that the engineering path is alive:
+
+- backward path was fixed after a rotary-cache issue
+- adaptation statistics confirm real updates
+- stride-64 remained active inside the better harnesses
+
+But every adapting run collapsed:
+
+- global epochs=1: 1.91513636
+- broad final-block adapting run: 2.04414684
+- attention-only localization: 2.14470812
+- MLP-only localization: 2.10066147
+- mlp.proj localization: 2.09906305
+- routing-only localization: 2.12150686
+- attn.proj localization: 2.11642883
+- attn.c_v localization: 2.13327565
+- c_v carrier adapting run: 2.13753050
+
+Interpretation:
+
+- Real adaptation is happening, but it is consistently catastrophic.
+- Localizing the updated parameters has not fixed the problem.
+- Adding gradient clipping helped only trivially and did not change the overall conclusion.
+
+5. Most Important Technical Finding About Self-Learning
+
+The key pattern is:
+
+- no-update score-first harnesses are often close to the static baseline
+- real adapting score-first runs collapse dramatically
+
+Concrete example:
+
+- apr01_r37_scorefirst_cv_carrier_anchor:
+  adapted_chunks=0, update_steps=0
+  final exact val_bpb = 1.17712638
+
+- apr01_r35_scorefirst_attn_proj_epochs1:
+  adapted_chunks=1892, update_steps=968704
+  final exact val_bpb = 2.11642883
+
+This strongly suggests the current problem is not “the TTT code path fails to trigger.”
+It triggers. The problem is that the online update rule is pushing the model in the wrong direction.
+
+Current working hypothesis:
+
+- the adaptation objective is misaligned with final post-quant performance
+- or the update magnitude / optimizer dynamics are far too aggressive
+- or the adaptation surface is intrinsically unstable on this compact model
+- or all three at once
+
+6. Why The Loop Looks “Blocked” Right Now
+
+The current run is:
+
+- RUN_ID: apr02_r40_scorefirst_cv_carrier_lr0001
+- branch base: promoted commit 3a4ce09
+- change: lower only TTT_LR from 0.002 to 0.001 on the c_v carrier adapting line
+
+Current observed state:
+
+- training reached step 20000/20000
+- no final post-quant metrics have been printed yet
+- train_gpt.py is still active
+
+Interpretation:
+
+- this is not a crash yet
+- it is stuck in the expensive final TTT evaluation stage
+- this behavior is consistent with earlier adapting score-first runs, where final eval took multiple hours
+
+This is why progress looks stalled: the current self-learning line has extremely long evals, and historically these long adapting evals have produced negative results anyway.
+
+7. What Is Actually Working vs Not Working
+
+Working:
+
+- orchestration / persistence / logging / email loop
+- local full-run experimentation on Seeweb
+- substrate improvements through eval/training/architecture tuning
+- sliding eval
+- LeakyReLU(0.5)^2 bridge
+- partial RoPE
+- EMA
+- longer warmdown
+- tiny carrier additions as static structural improvements
+
+Not working:
+
+- prefix/document/sequence TTT as a source of gains
+- LoRA-style eval-time adaptation
+- score-first adaptation with real online updates
+- localization of score-first updates to existing weights
+- localization of score-first updates to c_v carrier weights
+- current adapting line as a compute-efficient search direction
+
+8. Bottom-Line Assessment
+
+The project is making real progress, but almost entirely through better static modeling and evaluation, not through successful self-learning.
+
+Today’s honest summary is:
+
+- static/substrate optimization: clearly productive
+- TTT-aware harness design: partially productive
+- true self-learning with live updates: still unsuccessful and currently the main research failure
+
+The most likely reason for the apparent slowdown is that the loop is spending many hours inside a self-learning branch whose updates are both very slow and consistently harmful.
+
+9. Best Questions For A Fresh External Agent
+
+If this report is handed to another agent, the most valuable questions are:
+
+1. Why do score-first online updates consistently destroy post-quant quality even when the no-update harness is strong?
+2. What is the smallest possible self-learning update rule that could preserve the 1.177 static substrate instead of collapsing to ~2.1?
+3. Should the next self-learning attempts move away from “update existing weights” and toward a different class of fast weights, gates, or learned adapters?
+4. Should the search temporarily pivot away from self-learning and bank more static gains before retrying online adaptation?
+
+10. Files To Inspect First
+
+- /root/fmassapg/autoresearch/results.tsv
+- /root/fmassapg/logs/apr01_r37_scorefirst_cv_carrier_anchor.txt
+- /root/fmassapg/logs/apr01_r35_scorefirst_attn_proj_epochs1.txt
+- /root/fmassapg/logs/apr02_r40_scorefirst_cv_carrier_lr0001.txt
+- /root/fmassapg/train_gpt.py

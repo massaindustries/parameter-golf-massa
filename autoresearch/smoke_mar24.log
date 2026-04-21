@@ -1,0 +1,79 @@
+==========================================
+PARAMETER GOLF EXPERIMENT
+==========================================
+run_id:         smoke_mar24
+iterations:     20
+gpus:           1
+code_size:      73982 bytes
+timestamp:      2026-03-24T16:19:05+00:00
+==========================================
+logs/smoke_mar24.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:17059912
+ttt:enabled=False prefix_tokens:128 scope:document steps:1 lr:0.01 max_prefix_fraction:0.50 matched_params:18432 patterns:attn_scale,mlp_scale,resid_mix
+eval:stride:0 batch_seqs:32
+ema:enabled=False decay:0.997
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:524288 train_seq_len:1024 iterations:20 warmup_steps:20 max_wallclock_seconds:0.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:1/20 train_loss:6.9344 train_time:357ms step_avg:356.95ms
+step:2/20 train_loss:6.8314 train_time:700ms step_avg:349.96ms
+step:3/20 train_loss:6.7203 train_time:1043ms step_avg:347.69ms
+step:4/20 train_loss:6.6012 train_time:1387ms step_avg:346.64ms
+step:5/20 train_loss:6.4769 train_time:1730ms step_avg:345.96ms
+step:6/20 train_loss:6.3580 train_time:2073ms step_avg:345.47ms
+step:7/20 train_loss:6.2419 train_time:2416ms step_avg:345.15ms
+step:8/20 train_loss:6.1521 train_time:2759ms step_avg:344.91ms
+step:9/20 train_loss:6.0731 train_time:3103ms step_avg:344.77ms
+step:10/20 train_loss:6.0096 train_time:3447ms step_avg:344.67ms
+step:20/20 val_loss:5.7328 val_bpb:3.3953 train_time:6892ms step_avg:344.60ms eval_mode:standard eval_time:19547ms
+peak memory allocated: 10365 MiB reserved: 10426 MiB
+Serialized model: 67224578 bytes
+Code size: 73982 bytes
+Total submission size: 67298560 bytes
+Serialized model int8+zlib: 5036220 bytes (payload:17178912 raw_torch:17223564 payload_ratio:3.91x)
+Total submission size int8+zlib: 5110202 bytes
+final_int8_zlib_roundtrip val_loss:5.8220 val_bpb:3.4481 eval_mode:standard eval_time:11003ms
+final_int8_zlib_roundtrip_exact val_loss:5.82204205 val_bpb:3.44814124
+
+==========================================
+EXPERIMENT RESULTS
+==========================================
+wall_clock:     74s
+pre_quant:      step:20/20 val_loss:5.7328 val_bpb:3.3953 train_time:6892ms step_avg:344.60ms eval_mode:standard eval_time:19547ms
+post_quant:         log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+final_int8_zlib_roundtrip_exact val_loss:5.82204205 val_bpb:3.44814124
+artifact_size:          log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+Total submission size int8+zlib: 5110202 bytes
+artifact_mb:    5.11 MB
+headroom:       10.88 MB remaining
+memory:                 f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+peak memory allocated: 10365 MiB reserved: 10426 MiB
+==========================================
+EXPERIMENT COMPLETE
+==========================================

@@ -1,0 +1,2120 @@
+OpenAI Codex v0.116.0 (research preview)
+--------
+workdir: /root/fmassapg
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019d20ac-7441-7a41-aa22-74e0017ae937
+--------
+user
+Sei in /root/fmassapg sulla branch autoresearch/mar24.
+
+Obiettivo: eseguire il loop di autoresearch per la challenge Parameter Golf in autonomia, usando SOLO questa repo locale e il server corrente.
+
+Prima di fare esperimenti:
+- leggi autoresearch/program.md
+- leggi autoresearch/constraints.md
+- leggi train_gpt.py
+- conferma che i dati esistono in ./data/datasets/fineweb10B_sp1024/ e il tokenizer in ./data/tokenizers/
+- usa autoresearch/results.tsv come registro dei risultati
+
+Regole operative aggiuntive:
+- lavora sempre dalla repo root /root/fmassapg
+- NON fare network calls
+- NON modificare i file in autoresearch/ tranne autoresearch/results.tsv se devi registrare risultati
+- usa bash autoresearch/run_experiment.sh per lanciare i training, non comandi diversi salvo debug mirato
+- mantieni gli esperimenti atomici: una sola idea per commit
+- dopo ogni run estrai val_bpb e size dai log prodotti in logs/
+- conserva solo miglioramenti validi sotto 16000000 bytes
+- se una modifica non migliora o viola il size limit, reverti il commit dell'esperimento
+- continua in autonomia finché non vieni interrotto
+
+Formato risultati:
+- aggiorna autoresearch/results.tsv con le 7 colonne previste in program.md
+
+Nota pratica:
+- questa esecuzione stessa gira dentro tmux, quindi i processi del loop sono già persistenti rispetto alla sessione SSH
+- se fai code review o riassunti finali, tienili brevi e continua con il loop
+
+warning: Codex could not find system bubblewrap at /usr/bin/bwrap. Please install bubblewrap with your package manager. Codex will use the vendored bubblewrap in the meantime.
+mcp startup: no servers
+codex
+Leggo prima i file richiesti, controllo stato della repo e verifico dataset/tokenizer. Poi imposto un baseline dai risultati già registrati e preparo il primo esperimento atomico sulla branch `autoresearch/mar24`.
+exec
+/bin/bash -lc pwd in /root/fmassapg succeeded in 0ms:
+/root/fmassapg
+exec
+/bin/bash -lc 'git branch --show-current' in /root/fmassapg succeeded in 0ms:
+autoresearch/mar24
+exec
+/bin/bash -lc "sed -n '1,260p' train_gpt.py" in /root/fmassapg succeeded in 0ms:
+"""
+The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+
+Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+"""
+
+from __future__ import annotations
+
+import copy
+import glob
+import io
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+import uuid
+import zlib
+from pathlib import Path
+exec
+/bin/bash -lc 'git status --short' in /root/fmassapg succeeded in 0ms:
+?? autoresearch/
+?? final_model.int8.ptz
+?? final_model.pt
+exec
+/bin/bash -lc "sed -n '1,220p' autoresearch/run_experiment.sh" in /root/fmassapgexec
+/bin/bash -lc "sed -n '1,220p' autoresearch/program.md" in /root/fmassapg succeeded in 0ms:
+#!/bin/bash
+# run_experiment.sh — Parameter Golf autoresearch experiment runner
+# DO NOT MODIFY THIS FILE. The agent modifies train_gpt.py only.
+#
+# Usage:
+#   bash run_experiment.sh                    # default 2000 iterations
+#   ITERATIONS=500 bash run_experiment.sh     # quick smoke test
+#   ITERATIONS=5000 bash run_experiment.sh    # longer run for validation
+#
+# Environment variables (all optional, sensible defaults provided):
+#   ITERATIONS      — training steps (default: 2000)
+#   NPROC           — number of GPUs (default: 1)
+#   DATA_PATH       — path to dataset (default: ./data/datasets/fineweb10B_sp1024)
+#   TOKENIZER_PATH  — path to tokenizer (default: ./data/tokenizers/fineweb_1024_bpe.model)
+
+set -euo pipefail
+
+# --- Defaults ---
+ITERATIONS="${ITERATIONS:-2000}"
+NPROC="${NPROC:-1}"
+ succeeded in 0ms:
+# Parameter Golf Autoresearch
+
+Autonomous experimentation loop for OpenAI's Parameter Golf challenge.
+Goal: train the best language model that fits in 16MB, measured by bits-per-byte (val_bpb).
+
+## Setup
+
+To set up a new experiment, work with the user to:
+
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar24`). The branch `autoresearch/<tag>` must not already exist.
+2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main.
+3. **Read the in-scope files**: Read these files for full context:
+   - This `program.md` — experiment rules and constraints.
+   - `train_gpt.py` — the file you modify. Model architecture, optimizer, training loop, evaluation, quantization.
+4. **Verify data exists**: Check that `./data/datasets/fineweb10B_sp1024/` contains data shards and `./data/tokenizers/` contains the tokenizer. If not, tell the human to run `bash prepare.sh`.
+5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
+6. **Confirm and go**: Confirm setup looks good.
+
+Once you get confirmation, kick off the experimentation.
+
+exec
+/bin/bash -lc "sed -n '1,200p' autoresearch/results.tsv" in /root/fmassapg succeeded in 0ms:
+commit	val_bpb	size_bytes	size_ok	status	param_changes	description
+exec
+/bin/bash -lc "sed -n '1,240p' autoresearch/constraints.md" in /root/fmassapg succeeded in 0ms:
+# Parameter Golf Challenge — Hard Constraints
+
+These rules are immutable. Any experiment violating them is INVALID.
+
+## Artifact Size
+- Total artifact = code bytes (train_gpt.py UTF-8 encoded) + compressed model bytes (int8+zlib)
+- Maximum: 16,000,000 bytes (decimal, NOT 16 MiB)
+- No external downloads or network calls allowed during evaluation
+
+## Training Budget (final submission)
+- Maximum 10 minutes wall clock on 8×H100 SXM GPUs
+- During autoresearch iteration, we use a reduced budget (2000 steps on 1×H100) for fast feedback
+
+## Evaluation Budget (final submission)
+- Maximum 10 minutes wall clock on 8×H100 SXM GPUs
+- Evaluation must be fully self-contained and reproducible
+
+## Metric
+- `val_bpb` (bits per byte) on the fixed FineWeb validation set (first 50,000 documents)
+- Lower is better
+exec
+/bin/bash -lc "printf 'datasets:\\n'; ls -1 ./data/datasets/fineweb10B_sp1024/ | sed -n '1,20p'; printf '\\nTokenizer dirs:\\n'; ls -1 ./data/tokenizers/ | sed -n '1,20p'" in /root/fmassapg succeeded in 0ms:
+datasets:
+fineweb_train_000000.bin
+fineweb_train_000001.bin
+fineweb_train_000002.bin
+fineweb_train_000003.bin
+fineweb_train_000004.bin
+fineweb_train_000005.bin
+fineweb_train_000006.bin
+fineweb_train_000007.bin
+fineweb_train_000008.bin
+fineweb_train_000009.bin
+fineweb_train_000010.bin
+fineweb_train_000011.bin
+fineweb_train_000012.bin
+fineweb_train_000013.bin
+fineweb_train_000014.bin
+fineweb_train_000015.bin
+fineweb_train_000016.bin
+fineweb_train_000017.bin
+fineweb_train_000018.bin
+codex
+I vincoli sono chiari: dataset e tokenizer esistono, `results.tsv` è inizializzato solo con header, e il runner ufficiale è [autoresearch/run_experiment.sh](/root/fmassapg/autoresearch/run_experiment.sh). Adesso leggo le parti operative di `train_gpt.py` che controllano architettura, log finali e salvataggio nei log, poi faccio partire il baseline prima di cambiare codice.
+exec
+/bin/bash -lc "rg -n \"class Hyperparameters|class Transformer|class Block|class CausalSelfAttention|class MLP|final_int8_zlib_roundtrip|Total submission size int8\\+zlib|logs/|torch.save|INT8_CLIP_PERCENTILE|ROPE_BASE|LOGIT_SOFTCAP|EMA_ENABLED|bias\" train_gpt.py" in /root/fmassapg exited 127 in 0ms:
+/bin/bash: line 1: rg: command not found
+exec
+/bin/bash -lc "sed -n '260,620p' train_gpt.py" in /root/fmassapg succeeded in 0ms:
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+            raw_start = batch_seq_start * args.train_seq_len
+            raw_end = batch_seq_end * args.train_seq_len + 1
+            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            x = local[:-1].reshape(-1, args.train_seq_len)
+            y = local[1:].reshape(-1, args.train_seq_len)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                batch_loss = model(x, y).detach()
+            batch_token_count = float(y.numel())
+            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+            val_token_count += batch_token_count
+exec
+/bin/bash -lc "ls -lt logs 2>/dev/null | sed -n '1,20p'" in /root/fmassapg succeeded in 0ms:
+total 688
+-rw-r--r-- 1 root root  78439 Mar 24 16:20 smoke_mar24.txt
+-rw-r--r-- 1 root root  85570 Mar 24 15:35 slide_ema_5k.txt
+-rw-r--r-- 1 root root 244146 Mar 24 14:48 slide_ema_maxres.txt
+-rw-r--r-- 1 root root  73907 Mar 24 14:09 ttt_doc_safe1.txt
+-rw-r--r-- 1 root root  73828 Mar 24 13:53 ttt_doc_max1.txt
+-rw-r--r-- 1 root root  71451 Mar 24 11:53 ttt_doc_v1.txt
+-rw-r--r-- 1 root root  53655 Mar 24 09:55 baseline_test.txt
+exec
+/bin/bash -lc 'git log --oneline --decorate -n 10' in /root/fmassapg succeeded in 0ms:
+2397c5b (HEAD -> autoresearch/mar24, origin/main, main) Add sliding eval and EMA options
+5c68904 add autoresearch zip
+f0836b2 Add document-isolated TTT evaluation mode
+75837a1 Refine TTT eval controls and logging
+e5d3b91 Add chunk-local test-time training eval
+ebda3af Merge pull request #561 from openai/codex/update-readme-leaderboard-merged-records
+8a77849 Describe leaderboard entries by base-run diff
+d74c0b5 Use GitHub usernames in new leaderboard rows
+b82c50d Update README leaderboard with merged records
+b5ac0de Merge pull request #414 from signalrush/submission/ema-gptqlite-1.1233
+codex
+`train_gpt.py` non è un baseline minimale: su questa branch ci sono già opzioni per sliding eval, TTT ed EMA. Prima registro il punto di partenza reale di `HEAD` con un run pulito e poi decido la prima variazione singola in base a bpb/size osservati.
+exec
+/bin/bash -lc "grep -n \"class Transformer\\|class Block\\|class CausalSelfAttention\\|class MLP\\|class Attention\\|final_int8_zlib_roundtrip\\|Total submission size int8+zlib\\|logs/\\|EMA_ENABLED\\|INT8_CLIP_PERCENTILE\\|logit_softcap\\|rope_base\" train_gpt.py | sed -n '1,200p'" in /root/fmassapg succeeded in 0ms:
+81:    rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+82:    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+99:    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
+842:INT8_CLIP_PERCENTILE = 99.99984
+843:INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+1090:class CausalSelfAttention(nn.Module):
+1096:        rope_base: float,
+1116:        self.rotary = Rotary(self.head_dim, base=rope_base)
+1141:class MLP(nn.Module):
+1155:class Block(nn.Module):
+1162:        rope_base: float,
+1168:        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+1194:        logit_softcap: float,
+1195:        rope_base: float,
+1199:        if logit_softcap <= 0.0:
+1200:            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+1203:        self.logit_softcap = logit_softcap
+1216:                    rope_base,
+1257:        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+1312:        logfile = f"logs/{args.run_id}.txt"
+exec
+/bin/bash -lc 'for f in logs/*.txt; do echo "FILE $f"; grep -E "''^final_int8_zlib_roundtrip_exact |''^Total submission size int8'"\\+zlib:\" \""'$f" || true; echo; done | sed -n '"'1,200p'" in /root/fmassapg succeeded in 0ms:
+FILE logs/baseline_test.txt
+
+FILE logs/slide_ema_5k.txt
+Total submission size int8+zlib: 15872562 bytes
+final_int8_zlib_roundtrip_exact val_loss:2.09788101 val_bpb:1.24248489
+
+FILE logs/slide_ema_maxres.txt
+
+FILE logs/smoke_mar24.txt
+Total submission size int8+zlib: 5110202 bytes
+final_int8_zlib_roundtrip_exact val_loss:5.82204205 val_bpb:3.44814124
+
+FILE logs/ttt_doc_max1.txt
+Total submission size int8+zlib: 15752434 bytes
+final_int8_zlib_roundtrip_exact val_loss:2.86575098 val_bpb:1.69725904
+
+FILE logs/ttt_doc_safe1.txt
+
+FILE logs/ttt_doc_v1.txt
+
+Plan update
+Imposto il loop: baseline del commit corrente, poi esperimenti atomici con commit/revert basati solo su bpb e size, aggiornando ogni volta results.tsv.
+  ✓ Ispezionare le sezioni rilevanti di train_gpt.py e definire il punto di partenza reale di HEAD
+  → Eseguire e registrare il baseline del commit corrente
+  • Scegliere il prossimo cambiamento singolo, committarlo ed eseguire un nuovo run
+  • Tenere o revertire il commit in base a improvement e size, poi aggiornare results.tsv
+  • Ripetere il loop con la prossima idea finché c’è budget di turno
+codex
+Faccio partire il baseline del commit corrente senza toccare il codice. Questo mi dà il primo punto valido per `results.tsv` e fissa la soglia di miglioramento da battere nei commit successivi.
+exec
+/bin/bash -lc 'RUN_ID=baseline_head_mar24 bash autoresearch/run_experiment.sh' in /root/fmassapgcodex
+Il baseline è in esecuzione con `RUN_ID=baseline_head_mar24`. Nel frattempo preparo l’analisi delle parti architetturali per scegliere una variazione singola sensata appena arrivano bpb e size.
+exec
+/bin/bash -lc "sed -n '1080,1285p' train_gpt.py" in /root/fmassapg succeeded in 0ms:
+            self._seq_len_cached = seq_len
+        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+
+
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_base: float,
+        qk_gain_init: float,
+    ):
+        super().__init__()
+exec
+/bin/bash -lc "sed -n '1285,1715p' train_gpt.py" in /root/fmassapg succeeded in 0ms:
+        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
+    if 8 % world_size != 0:
+        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+    grad_accum_steps = 8 // world_size
+    grad_scale = 1.0 / grad_accum_steps
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
+    master_process = rank == 0
+
+    # Fast math knobs
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+
+    enable_cudnn_sdp(False)
+codex
+Ho visto il nucleo del modello: stack encoder/decoder con skip pesati, GQA, relu² MLP, `q_gain` per testa, `logit_softcap`, RoPE parametrico e quantizzazione int8+zlib fissa. Appena chiude il baseline scelgo una variazione che resti davvero “una sola idea”: o shape, o attivazione, o dinamica, non mix.
+exec
+/bin/bash -lc "sed -n '1,120p' logs/slide_ema_5k.txt" in /root/fmassapg succeeded in 0ms:
+"""
+The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+
+Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+"""
+
+from __future__ import annotations
+
+import copy
+import glob
+import io
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+import uuid
+import zlib
+from pathlib import Path
+exec
+/bin/bash -lc "sed -n '1,120p' logs/smoke_mar24.txt" in /root/fmassapg succeeded in 0ms:
+"""
+The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+
+Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+"""
+
+from __future__ import annotations
+
+import copy
+import glob
+import io
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+import uuid
+import zlib
+from pathlib import Path
+exec
+/bin/bash -lc "sed -n '1,120p' logs/ttt_doc_max1.txt" in /root/fmassapg succeeded in 0ms:
+"""
+The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+
+Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+"""
+
+from __future__ import annotations
+
+import copy
+import glob
+import io
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+import uuid
+import zlib
+from pathlib import Path
+exec
+/bin/bash -lc "grep -E \"model_params:|eval:stride:|ema:enabled=|ttt:enabled=|attention_mode:|tie_embeddings:|train_batch_tokens:|final_int8_zlib_roundtrip_exact|Total submission size int8\\+zlib\" logs/slide_ema_5k.txt" in /root/fmassapg succeeded in 0ms:
+        tie_embeddings: bool,
+        if self.tie_embeddings:
+        if self.tie_embeddings:
+    log0(f"model_params:{n_params}")
+        f"ttt:enabled={args.ttt_enable} prefix_tokens:{args.ttt_prefix_tokens} "
+    log0(f"eval:stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
+    log0(f"ema:enabled={args.ema_enabled} decay:{args.ema_decay}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+model_params:17059912
+ttt:enabled=False prefix_tokens:128 scope:document steps:1 lr:0.01 max_prefix_fraction:0.50 matched_params:18432 patterns:attn_scale,mlp_scale,resid_mix
+eval:stride:64 batch_seqs:32
+ema:enabled=True decay:0.997
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:262144 train_seq_len:1024 iterations:5000 warmup_steps:20 max_wallclock_seconds:0.000
+Total submission size int8+zlib: 15872562 bytes
+exec
+/bin/bash -lc "grep -E \"model_params:|eval:stride:|ema:enabled=|ttt:enabled=|attention_mode:|tie_embeddings:|train_batch_tokens:|final_int8_zlib_roundtrip_exact|Total submission size int8\\+zlib\" logs/smoke_mar24.txt" in /root/fmassapg succeeded in 0ms:
+        tie_embeddings: bool,
+        if self.tie_embeddings:
+        if self.tie_embeddings:
+    log0(f"model_params:{n_params}")
+        f"ttt:enabled={args.ttt_enable} prefix_tokens:{args.ttt_prefix_tokens} "
+    log0(f"eval:stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
+    log0(f"ema:enabled={args.ema_enabled} decay:{args.ema_decay}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+model_params:17059912
+ttt:enabled=False prefix_tokens:128 scope:document steps:1 lr:0.01 max_prefix_fraction:0.50 matched_params:18432 patterns:attn_scale,mlp_scale,resid_mix
+eval:stride:0 batch_seqs:32
+ema:enabled=False decay:0.997
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:524288 train_seq_len:1024 iterations:20 warmup_steps:20 max_wallclock_seconds:0.000
+Total submission size int8+zlib: 5110202 bytes
+exec
+/bin/bash -lc "grep -E \"model_params:|eval:stride:|ema:enabled=|ttt:enabled=|attention_mode:|tie_embeddings:|train_batch_tokens:|final_int8_zlib_roundtrip_exact|Total submission size int8\\+zlib\" logs/ttt_doc_max1.txt" in /root/fmassapg succeeded in 0ms:
+        tie_embeddings: bool,
+        if self.tie_embeddings:
+        if self.tie_embeddings:
+    log0(f"model_params:{n_params}")
+        f"ttt:enabled={args.ttt_enable} prefix_tokens:{args.ttt_prefix_tokens} "
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+model_params:17059912
+ttt:enabled=True prefix_tokens:128 scope:document steps:1 lr:0.01 max_prefix_fraction:0.50 matched_params:18432 patterns:attn_scale,mlp_scale,resid_mix
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:262144 train_seq_len:1024 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+Total submission size int8+zlib: 15752434 bytes
+final_int8_zlib_roundtrip_exact val_loss:2.86575098 val_bpb:1.69725904
+codex
+Il baseline conferma il profilo attuale di `HEAD`: 17.06M parametri, GQA 8/4, `relu^2`, `EMA` disattivata, sliding eval disattivato, batch 524288, 2000 step. La size sarà quasi certamente vicina al tetto, quindi le prime prove utili sono idee a costo-parametri zero o quasi zero.
+exec
+/bin/bash -lc 'grep -n "def run_validation" -A120 train_gpt.py' in /root/fmassapgexec
+/bin/bash -lc "sed -n '760,930p' train_gpt.py" in /root/fmassapg succeeded in 0ms:
+751:def run_validation(
+752-    args: Hyperparameters,
+753-    model: nn.Module,
+754-    base_model: nn.Module,
+755-    rank: int,
+756-    world_size: int,
+757-    device: torch.device,
+758-    grad_accum_steps: int,
+759-    val_tokens: Tensor,
+760-    val_tokens_ttt: Tensor,
+761-    base_bytes_lut: Tensor,
+762-    has_leading_space_lut: Tensor,
+763-    is_boundary_token_lut: Tensor,
+764-    ttt_params: list[Tensor],
+765-    bos_token_id: int,
+766-) -> tuple[float, float, str]:
+767-    if args.ttt_enable:
+768-        val_loss, val_bpb = eval_val_ttt(
+769-            args,
+770-            base_model,
+ succeeded in 0ms:
+    val_tokens_ttt: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    ttt_params: list[Tensor],
+    bos_token_id: int,
+) -> tuple[float, float, str]:
+    if args.ttt_enable:
+        val_loss, val_bpb = eval_val_ttt(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens_ttt,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            ttt_params,
+codex
+Sto aspettando che il baseline arrivi alla validazione finale; nel frattempo la scelta più probabile per il primo commit è `eval_stride` o `EMA`, perché sono miglioramenti senza costo di parametri e qui il budget di bytes è già stretto.
+exec
+/bin/bash -lc "grep -E \"model_params:|eval:stride:|ema:enabled=|ttt:enabled=|attention_mode:|tie_embeddings:|train_batch_tokens:|final_int8_zlib_roundtrip_exact|Total submission size int8\\+zlib\" logs/slide_ema_maxres.txt" in /root/fmassapg succeeded in 0ms:
+        tie_embeddings: bool,
+        if self.tie_embeddings:
+        if self.tie_embeddings:
+    log0(f"model_params:{n_params}")
+        f"ttt:enabled={args.ttt_enable} prefix_tokens:{args.ttt_prefix_tokens} "
+    log0(f"eval:stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
+    log0(f"ema:enabled={args.ema_enabled} decay:{args.ema_decay}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+model_params:17059912
+ttt:enabled=False prefix_tokens:128 scope:document steps:1 lr:0.01 max_prefix_fraction:0.50 matched_params:18432 patterns:attn_scale,mlp_scale,resid_mix
+eval:stride:64 batch_seqs:32
+ema:enabled=True decay:0.997
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:262144 train_seq_len:1024 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+        tie_embeddings: bool,
+exec
+/bin/bash -lc "grep -E \"model_params:|eval:stride:|ema:enabled=|ttt:enabled=|attention_mode:|tie_embeddings:|train_batch_tokens:|step:.*val_bpb:|final_int8_zlib_roundtrip_exact|Total submission size int8\\+zlib\" logs/baseline_test.txt" in /root/fmassapg succeeded in 0ms:
+        tie_embeddings: bool,
+        if self.tie_embeddings:
+        if self.tie_embeddings:
+    log0(f"model_params:{n_params}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+model_params:17059912
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:524288 train_seq_len:1024 iterations:20000 warmup_steps:20 max_wallclock_seconds:0.000
+step:0/20000 val_loss:6.9344 val_bpb:4.1069 train_time:0ms step_avg:0.01ms
+step:200/20000 val_loss:2.8482 val_bpb:1.6869 train_time:69229ms step_avg:346.15ms
+step:400/20000 val_loss:2.5625 val_bpb:1.5176 train_time:138795ms step_avg:346.99ms
+step:600/20000 val_loss:2.4482 val_bpb:1.4500 train_time:208040ms step_avg:346.73ms
+step:800/20000 val_loss:2.3799 val_bpb:1.4095 train_time:277247ms step_avg:346.56ms
+step:1000/20000 val_loss:2.3342 val_bpb:1.3824 train_time:346464ms step_avg:346.46ms
+codex
+C’è un dato utile dai log storici già presenti: sullo stesso assetto architetturale il run standard scende intorno a `1.322` a 2000 step, quindi il baseline attuale dovrebbe chiudere lì vicino. Questo rende ancora più probabile che il primo miglioramento pulito sia `eval_stride=64`, poi eventualmente `EMA` sopra quello se il commit viene tenuto.
+ succeeded in 12m 27s:
+logs/baseline_head_mar24.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:17059912
+ttt:enabled=False prefix_tokens:128 scope:document steps:1 lr:0.01 max_prefix_fraction:0.50 matched_params:18432 patterns:attn_scale,mlp_scale,resid_mix
+eval:stride:0 batch_seqs:32
+ema:enabled=False decay:0.997
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:524288 train_seq_len:1024 iterations:2000 warmup_steps:20 max_wallclock_seconds:0.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for websocket)
+codex
+Il baseline ha chiuso valido: `val_bpb=1.29656339`, `size=15056094`, quindi `HEAD` parte già sotto tetto con circa `0.94 MB` di margine. Ora registro questo punto in `results.tsv`, poi faccio il primo commit atomico cambiando solo la default di `eval_stride` per misurare il guadagno del contesto scorrevole a parità di training.
+file update
+M /root/fmassapg/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+apply_patch(auto_approved=true) exited 0 in 5ms:
+Success. Updated the following files:
+M /root/fmassapg/autoresearch/results.tsv
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+
+exec
+/bin/bash -lc 'git status --short' in /root/fmassapg succeeded in 0ms:
+?? autoresearch/
+?? final_model.int8.ptz
+?? final_model.pt
+exec
+/bin/bash -lc "grep -n \"eval_stride = int(os.environ.get(\\\"EVAL_STRIDE\\\"\" -n train_gpt.py" in /root/fmassapg succeeded in 0ms:
+52:    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+
+codex
+Modifico solo una default in `train_gpt.py`: `EVAL_STRIDE` passa da `0` a `64`. Non tocco training, parametri o quantizzazione; l’idea testata è solo “usare più contesto in valutazione finale”.
+file update
+M /root/fmassapg/train_gpt.py
+@@ -51,3 +51,3 @@
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+apply_patch(auto_approved=true) exited 0 in 9ms:
+Success. Updated the following files:
+M /root/fmassapg/train_gpt.py
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+exec
+/bin/bash -lc 'git add train_gpt.py && git commit -m "Default to sliding eval stride 64"' in /root/fmassapg exited 128 in 0ms:
+Author identity unknown
+
+*** Please tell me who you are.
+
+Run
+
+  git config --global user.email "you@example.com"
+  git config --global user.name "Your Name"
+
+to set your account's default identity.
+Omit --global to set the identity only in this repository.
+
+fatal: unable to auto-detect email address (got 'root@ceccano-vs-openai.(none)')
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+codex
+Il commit è bloccato solo da identità git non configurata nella repo. Imposto `user.name` e `user.email` locali, poi rifaccio il commit e lancio il run dell’esperimento.
+exec
+/bin/bash -lc 'git config user.name "Codex" && git config user.email "codex@local" && git add train_gpt.py && git commit -m "Default to sliding eval stride 64"' in /root/fmassapg succeeded in 0ms:
+[autoresearch/mar24 88ae44b] Default to sliding eval stride 64
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+codex
+Il commit dell’esperimento è `88ae44b`. Parto col run ufficiale; a fine esecuzione userò solo `val_bpb` post-quant e `Total submission size int8+zlib` per decidere keep o revert del commit.
+exec
+/bin/bash -lc 'RUN_ID=exp_evalstride64_88ae44b bash autoresearch/run_experiment.sh' in /root/fmassapgfile update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+codex
+Questo run allunga soprattutto la valutazione finale, non il training, quindi i tempi per step dovrebbero restare quasi invariati. Se il bpb scende in modo netto senza sforare i 16M, il commit resta e il prossimo giro sarà `EMA` sopra questa base.
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+codex
+Il run con `eval_stride=64` sta procedendo come il baseline sul lato training, quindi il confronto sarà pulito. Mi interessa quasi solo la riga finale `final_int8_zlib_roundtrip_exact`: se migliora anche di poco, questo commit si tiene perché la size non dovrebbe muoversi in modo materiale.
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+codex
+La parte lenta adesso è la validazione sliding sul checkpoint finale. Se resta nei tempi e scende sotto `1.29656339`, tengo il commit senza esitazioni perché è una miglioria a bytes praticamente invariati.
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+exec
+/bin/bash -lc 'tail -n 20 logs/exp_evalstride64_88ae44b.txt' in /root/fmassapg succeeded in 0ms:
+step:1/2000 train_loss:6.9344 train_time:355ms step_avg:354.55ms
+step:2/2000 train_loss:16.3409 train_time:954ms step_avg:476.81ms
+step:3/2000 train_loss:7.9790 train_time:1298ms step_avg:432.78ms
+step:4/2000 train_loss:6.8232 train_time:1643ms step_avg:410.73ms
+step:5/2000 train_loss:7.0176 train_time:1987ms step_avg:397.47ms
+step:6/2000 train_loss:6.9533 train_time:2332ms step_avg:388.65ms
+step:7/2000 train_loss:6.4459 train_time:2676ms step_avg:382.34ms
+step:8/2000 train_loss:6.2231 train_time:3021ms step_avg:377.60ms
+step:9/2000 train_loss:6.1053 train_time:3365ms step_avg:373.93ms
+step:10/2000 train_loss:6.0060 train_time:3710ms step_avg:370.96ms
+step:200/2000 train_loss:2.8087 train_time:69271ms step_avg:346.36ms
+step:400/2000 train_loss:2.3968 train_time:138328ms step_avg:345.82ms
+step:600/2000 train_loss:2.4975 train_time:207413ms step_avg:345.69ms
+step:800/2000 train_loss:2.3495 train_time:276682ms step_avg:345.85ms
+step:1000/2000 train_loss:2.3529 train_time:345921ms step_avg:345.92ms
+step:1200/2000 train_loss:2.2715 train_time:414999ms step_avg:345.83ms
+step:1400/2000 train_loss:2.2959 train_time:484113ms step_avg:345.80ms
+step:1600/2000 train_loss:2.1837 train_time:553162ms step_avg:345.73ms
+step:1800/2000 train_loss:2.2212 train_time:622272ms step_avg:345.71ms
+step:2000/2000 train_loss:2.1751 train_time:691481ms step_avg:345.74ms
+exec
+/bin/bash -lc "ps -o pid,etimes,cmd -C python -C python3 -C torchrun | sed -n '1,20p'" in /root/fmassapg succeeded in 0ms:
+    PID ELAPSED CMD
+ 139240    1377 /usr/bin/python3 -u train_gpt.py
+ 139258    1375 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139307    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139309    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139311    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139313    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139315    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139317    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139319    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139321    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139323    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139324    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139325    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139326    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139327    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139328    1374 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139335    1373 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+ 139336    1373 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=139240 --read-fd=3 --write-fd=6
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+codex
+Questo esperimento ha superato il limite operativo di 15 minuti totali: il training è finito, ma la valutazione sliding sta sforando troppo. Lo interrompo e lo tratto come failure; quindi il commit non resta come base.
+exec
+/bin/bash -lc "pkill -f 'train_gpt.py' || true" in /root/fmassapg exited -1 in 0ms:
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+ exited 1 in 23m 07s:
+logs/exp_evalstride64_88ae44b.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:17059912
+ttt:enabled=False prefix_tokens:128 scope:document steps:1 lr:0.01 max_prefix_fraction:0.50 matched_params:18432 patterns:attn_scale,mlp_scale,resid_mix
+eval:stride:64 batch_seqs:32
+ema:enabled=False decay:0.997
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:524288 train_seq_len:1024 iterations:2000 warmup_steps:20 max_wallclock_seconds:0.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+exec
+/bin/bash -lc 'tail -n 30 logs/exp_evalstride64_88ae44b.txt' in /root/fmassapg succeeded in 0ms:
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:1/2000 train_loss:6.9344 train_time:355ms step_avg:354.55ms
+step:2/2000 train_loss:16.3409 train_time:954ms step_avg:476.81ms
+step:3/2000 train_loss:7.9790 train_time:1298ms step_avg:432.78ms
+step:4/2000 train_loss:6.8232 train_time:1643ms step_avg:410.73ms
+step:5/2000 train_loss:7.0176 train_time:1987ms step_avg:397.47ms
+step:6/2000 train_loss:6.9533 train_time:2332ms step_avg:388.65ms
+step:7/2000 train_loss:6.4459 train_time:2676ms step_avg:382.34ms
+step:8/2000 train_loss:6.2231 train_time:3021ms step_avg:377.60ms
+step:9/2000 train_loss:6.1053 train_time:3365ms step_avg:373.93ms
+step:10/2000 train_loss:6.0060 train_time:3710ms step_avg:370.96ms
+exec
+/bin/bash -lc "ps -o pid,etimes,cmd -C python -C python3 -C torchrun | sed -n '1,20p'" in /root/fmassapg succeeded in 0ms:
+    PID ELAPSED CMD
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..d2fff818c1efb3b27f2ec380cd4aa1ab1925cdf2
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,2 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+codex
+Registro l’esperimento `88ae44b` come failure per timeout: niente metriche finali, quindi `val_bpb=0` e `size=0`. Subito dopo faccio `git revert` del commit per tornare alla base valida.
+file update
+M /root/fmassapg/autoresearch/results.tsv
+@@ -2 +2,2 @@
+ 2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+apply_patch(auto_approved=true) exited 0 in 8ms:
+Success. Updated the following files:
+M /root/fmassapg/autoresearch/results.tsv
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9a888478a8da0958fc9f1706f81dcfed92853293
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,3 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9a888478a8da0958fc9f1706f81dcfed92853293
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,3 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..ee85275fc24d20dbfd5f22c88cdb8a447c88ccb0
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -49,7 +49,7 @@
+     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
++    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+     ttt_enable = bool(int(os.environ.get("TTT_ENABLE", "0")))
+     ttt_scope = os.environ.get("TTT_SCOPE", "document").strip().lower()
+
+exec
+/bin/bash -lc 'git revert --no-edit HEAD' in /root/fmassapg succeeded in 0ms:
+[autoresearch/mar24 44339ad] Revert "Default to sliding eval stride 64"
+ Date: Tue Mar 24 17:11:18 2026 +0000
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9a888478a8da0958fc9f1706f81dcfed92853293
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,3 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+
+codex
+`eval_stride=64` è scartato non per qualità ma per budget di tempo: su questa macchina la validazione finale sfora. La prossima prova resta a costo-parametri zero ma senza penalità di eval, quindi abilito solo `EMA` di default.
+file update
+M /root/fmassapg/train_gpt.py
+@@ -98,3 +98,3 @@
+     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
++    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+apply_patch(auto_approved=true) exited 0 in 8ms:
+Success. Updated the following files:
+M /root/fmassapg/train_gpt.py
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9a888478a8da0958fc9f1706f81dcfed92853293
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,3 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..02e2d796582587ec324d531568983098b063a4d7
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -96,7 +96,7 @@
+     beta2 = float(os.environ.get("BETA2", 0.95))
+     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
++    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+ 
+ # -----------------------------
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9a888478a8da0958fc9f1706f81dcfed92853293
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,3 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..02e2d796582587ec324d531568983098b063a4d7
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -96,7 +96,7 @@
+     beta2 = float(os.environ.get("BETA2", 0.95))
+     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
++    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+ 
+ # -----------------------------
+
+exec
+/bin/bash -lc 'git add train_gpt.py && git commit -m "Enable EMA by default"' in /root/fmassapg succeeded in 0ms:
+[autoresearch/mar24 3de950f] Enable EMA by default
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9a888478a8da0958fc9f1706f81dcfed92853293
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,3 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..02e2d796582587ec324d531568983098b063a4d7
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -96,7 +96,7 @@
+     beta2 = float(os.environ.get("BETA2", 0.95))
+     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
++    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+ 
+ # -----------------------------
+
+codex
+Il nuovo commit è `3de950f`. Lo eseguo con il runner ufficiale; qui mi aspetto stesso budget tempo del baseline e size sostanzialmente identica, quindi la decisione dipenderà quasi solo dal bpb post-quant.
+exec
+/bin/bash -lc 'RUN_ID=exp_ema_default_3de950f bash autoresearch/run_experiment.sh' in /root/fmassapgfile update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9a888478a8da0958fc9f1706f81dcfed92853293
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,3 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..02e2d796582587ec324d531568983098b063a4d7
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -96,7 +96,7 @@
+     beta2 = float(os.environ.get("BETA2", 0.95))
+     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
++    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+ 
+ # -----------------------------
+
+codex
+Questa è una prova più pulita: `EMA` non cambia la forma del modello, non gonfia l’artifact e non allunga la validazione finale in modo sostanziale. Se batte `1.29656339`, il commit resta e da lì provo un’altra variazione singola.
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9a888478a8da0958fc9f1706f81dcfed92853293
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,3 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..02e2d796582587ec324d531568983098b063a4d7
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -96,7 +96,7 @@
+     beta2 = float(os.environ.get("BETA2", 0.95))
+     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
++    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+ 
+ # -----------------------------
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9a888478a8da0958fc9f1706f81dcfed92853293
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,3 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..02e2d796582587ec324d531568983098b063a4d7
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -96,7 +96,7 @@
+     beta2 = float(os.environ.get("BETA2", 0.95))
+     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
++    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+ 
+ # -----------------------------
+
+codex
+`EMA` sta costando qualcosa in train time, ma per ora il run resta plausibilmente sotto il tetto di 15 minuti complessivi. Se vedo che il passo medio porta oltre soglia, lo interrompo anche questo; altrimenti aspetto il risultato finale.
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9a888478a8da0958fc9f1706f81dcfed92853293
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,3 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..02e2d796582587ec324d531568983098b063a4d7
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -96,7 +96,7 @@
+     beta2 = float(os.environ.get("BETA2", 0.95))
+     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
++    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+ 
+ # -----------------------------
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9a888478a8da0958fc9f1706f81dcfed92853293
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,3 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..02e2d796582587ec324d531568983098b063a4d7
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -96,7 +96,7 @@
+     beta2 = float(os.environ.get("BETA2", 0.95))
+     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
++    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+ 
+ # -----------------------------
+
+ succeeded in 13m 41s:
+logs/exp_ema_default_3de950f.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:17059912
+ttt:enabled=False prefix_tokens:128 scope:document steps:1 lr:0.01 max_prefix_fraction:0.50 matched_params:18432 patterns:attn_scale,mlp_scale,resid_mix
+eval:stride:0 batch_seqs:32
+ema:enabled=True decay:0.997
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:524288 train_seq_len:1024 iterations:2000 warmup_steps:20 max_wallclock_seconds:0.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+codex
+`EMA` è peggiorativo nel punteggio che conta: pre-quant migliora leggermente, ma dopo roundtrip int8 sale a `1.30088756`, quindi è un discard. Registro il risultato e revert del commit.
+file update
+M /root/fmassapg/autoresearch/results.tsv
+@@ -3 +3,2 @@
+ 88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+apply_patch(auto_approved=true) exited 0 in 9ms:
+Success. Updated the following files:
+M /root/fmassapg/autoresearch/results.tsv
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..02e2d796582587ec324d531568983098b063a4d7
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -96,7 +96,7 @@
+     beta2 = float(os.environ.get("BETA2", 0.95))
+     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
++    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+ 
+ # -----------------------------
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..02e2d796582587ec324d531568983098b063a4d7
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -96,7 +96,7 @@
+     beta2 = float(os.environ.get("BETA2", 0.95))
+     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
++    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+ 
+ # -----------------------------
+
+exec
+/bin/bash -lc 'git revert --no-edit HEAD' in /root/fmassapg succeeded in 0ms:
+[autoresearch/mar24 e4c6e1c] Revert "Enable EMA by default"
+ Date: Tue Mar 24 17:25:35 2026 +0000
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+
+codex
+Ho escluso due direzioni per il prossimo giro: più contesto in eval sfora il tempo, e `EMA` peggiora il punteggio dopo quantizzazione. Ora cerco un’idea che non cambi il budget tempo e abbia chance di agire direttamente sul roundtrip int8, oppure un piccolo cambio architetturale quasi gratuito in bytes.
+exec
+/bin/bash -lc "grep -n \"class CastedLinear\\|def __init__(self, in_features\\|bias=\" -A80 train_gpt.py | sed -n '1,200p'" in /root/fmassapg succeeded in 0ms:
+1044:class CastedLinear(nn.Linear):
+1045-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+1046-    def forward(self, x: Tensor) -> Tensor:
+1047-        bias = self.bias.to(x.dtype) if self.bias is not None else None
+1048-        return F.linear(x, self.weight.to(x.dtype), bias)
+1049-
+1050-
+1051-def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
+1052-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
+1053-    with torch.no_grad():
+1054-        for name, param in module.named_parameters():
+1055-            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+1056-                param.data = param.data.float()
+1057-
+1058-
+1059-class Rotary(nn.Module):
+1060-    # Caches cos/sin tables per sequence length on the current device.
+1061-    def __init__(self, dim: int, base: float = 10000.0):
+1062-        super().__init__()
+1063-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+exec
+/bin/bash -lc "grep -n \"INT8_CLIP_PERCENTILE\\|INT8_KEEP_FLOAT_MAX_NUMEL\\|INT8_KEEP_FLOAT_STORE_DTYPE\" -A40 train_gpt.py" in /root/fmassapg succeeded in 0ms:
+839:INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+840:INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+841-INT8_PER_ROW_SCALE_DTYPE = torch.float16
+842:INT8_CLIP_PERCENTILE = 99.99984
+843:INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+844-
+845-def tensor_nbytes(t: Tensor) -> int:
+846-    return int(t.numel()) * int(t.element_size())
+847-
+848-def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+849-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+850-        return t.float().contiguous()
+851-    if t.dtype in {torch.float32, torch.bfloat16}:
+852-        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+853:        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+854-    return t
+855-
+856-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+857-    t32 = t.float()
+858-    if t32.ndim == 2:
+exec
+/bin/bash -lc "grep -n \"peak memory allocated\\|max_memory_allocated\" -A5 -B5 train_gpt.py" in /root/fmassapg succeeded in 0ms:
+1632-            reached_cap = bool(reached_cap_tensor.item())
+1633-        if stop_after_step is None and reached_cap:
+1634-            stop_after_step = step
+1635-
+1636-    log0(
+1637:        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+1638-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+1639-    )
+1640-    if ema_state is not None:
+1641-        log0("ema:applying shadow weights")
+1642-        current_state = base_model.state_dict()
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+
+codex
+Vado su una prova a costo zero in tempo e bytes: abbasso leggermente `INT8_CLIP_PERCENTILE` da `99.99984` a `99.999`. L’idea è comprimere un po’ di più gli outlier per ridurre l’errore del roundtrip int8, senza toccare training o architettura.
+file update
+M /root/fmassapg/train_gpt.py
+@@ -841,3 +841,3 @@
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+apply_patch(auto_approved=true) exited 0 in 9ms:
+Success. Updated the following files:
+M /root/fmassapg/train_gpt.py
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+exec
+/bin/bash -lc 'git add train_gpt.py && git commit -m "Lower int8 clip percentile"' in /root/fmassapg succeeded in 0ms:
+[autoresearch/mar24 9d098c5] Lower int8 clip percentile
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+codex
+Il commit corrente è `9d098c5`. Lancio il run ufficiale; qui il training dovrebbe essere identico al baseline, quindi ogni differenza nel risultato finale sarà quasi interamente attribuibile alla quantizzazione.
+exec
+/bin/bash -lc 'RUN_ID=exp_clip99999_9d098c5 bash autoresearch/run_experiment.sh' in /root/fmassapgfile update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+codex
+Questo test è metodologicamente pulito: stesso training del baseline, stessa architettura, solo roundtrip int8 leggermente diverso. Se migliora anche di pochi millesimi senza cambiare size, vale la pena tenerlo come nuova base.
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for websocket)
+codex
+Il run sta andando un po’ più lento del baseline per variabilità di macchina, ma resta ancora nel budget. Qui non mi interessa la traiettoria di train loss: il segnale vero sarà la differenza tra `step:2000 val_bpb` e `final_int8_zlib_roundtrip_exact val_bpb` rispetto al baseline.
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+exec
+/bin/bash -lc 'date -u +%H:%M:%S' in /root/fmassapg succeeded in 0ms:
+17:53:16
+exec
+/bin/bash -lc "ps -o pid,etimes,cmd -C python -C python3 -C torchrun | sed -n '1,20p'" in /root/fmassapg succeeded in 0ms:
+    PID ELAPSED CMD
+ 145983     984 /usr/bin/python3 -u train_gpt.py
+ 146000     982 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146046     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146047     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146048     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146049     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146052     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146053     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146054     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146055     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146059     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146060     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146061     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146062     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146063     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146064     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146074     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146076     980 /usr/bin/python3 /usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_worker/__main__.py --workers=16 --parent=145983 --read-fd=3 --write-fd=6
+ 146799     715 python3 train_optimized_gpt.py
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+codex
+C’è anche un altro training esterno in esecuzione sulla macchina e questo run è già oltre 15 minuti reali. Lo interrompo come timeout operativo; il commit non può essere accettato in queste condizioni.
+exec
+/bin/bash -lc 'pkill -f "python3 -u train_gpt.py" || true' in /root/fmassapg exited -1 in 0ms:
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+ exited 1 in 16m 36s:
+logs/exp_clip99999_9d098c5.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:17059912
+ttt:enabled=False prefix_tokens:128 scope:document steps:1 lr:0.01 max_prefix_fraction:0.50 matched_params:18432 patterns:attn_scale,mlp_scale,resid_mix
+eval:stride:0 batch_seqs:32
+ema:enabled=False decay:0.997
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:524288 train_seq_len:1024 iterations:2000 warmup_steps:20 max_wallclock_seconds:0.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+exec
+/bin/bash -lc 'tail -n 25 logs/exp_clip99999_9d098c5.txt' in /root/fmassapg succeeded in 0ms:
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:1/2000 train_loss:6.9344 train_time:365ms step_avg:364.96ms
+step:2/2000 train_loss:16.3409 train_time:1163ms step_avg:581.40ms
+step:3/2000 train_loss:7.9790 train_time:1516ms step_avg:505.49ms
+step:4/2000 train_loss:6.8231 train_time:1870ms step_avg:467.49ms
+step:5/2000 train_loss:7.0173 train_time:2223ms step_avg:444.65ms
+step:6/2000 train_loss:6.9531 train_time:2577ms step_avg:429.43ms
+step:7/2000 train_loss:6.4459 train_time:2971ms step_avg:424.36ms
+step:8/2000 train_loss:6.2231 train_time:3324ms step_avg:415.45ms
+step:9/2000 train_loss:6.1052 train_time:3677ms step_avg:408.55ms
+step:10/2000 train_loss:6.0060 train_time:4030ms step_avg:403.00ms
+step:200/2000 train_loss:2.8125 train_time:73524ms step_avg:367.62ms
+step:400/2000 train_loss:2.4016 train_time:166464ms step_avg:416.16ms
+exec
+/bin/bash -lc "ps -o pid,etimes,cmd -C python -C python3 -C torchrun | sed -n '1,20p'" in /root/fmassapg succeeded in 0ms:
+    PID ELAPSED CMD
+ 146799     729 python3 train_optimized_gpt.py
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..9cd289a40dce9cf586dda8061074dac73ef36924
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,4 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+Reconnecting... 2/5 (timeout waiting for child process to exit)
+Reconnecting... 3/5 (timeout waiting for child process to exit)
+Reconnecting... 4/5 (timeout waiting for child process to exit)
+codex
+Questo timeout è chiaramente contaminato da contention sulla macchina: c’è un altro `train_optimized_gpt.py` attivo e il passo medio è degenerato durante il run. Registro comunque `9d098c5` come crash/timeout e revert del commit per non tenere un risultato invalido.
+file update
+M /root/fmassapg/autoresearch/results.tsv
+@@ -4 +4,2 @@
+ 3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+apply_patch(auto_approved=true) exited 0 in 8ms:
+Success. Updated the following files:
+M /root/fmassapg/autoresearch/results.tsv
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+diff --git a/train_gpt.py b/train_gpt.py
+index 8f736d94a72e41deb48fb08d85c25400a503e33d..0599d5a8852a07df2010c9000b2edde35c262d1b
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -839,7 +839,7 @@
+ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+ INT8_PER_ROW_SCALE_DTYPE = torch.float16
+-INT8_CLIP_PERCENTILE = 99.99984
++INT8_CLIP_PERCENTILE = 99.999
+ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ 
+ def tensor_nbytes(t: Tensor) -> int:
+
+exec
+/bin/bash -lc 'git revert --no-edit HEAD' in /root/fmassapg succeeded in 0ms:
+[autoresearch/mar24 b3d965e] Revert "Lower int8 clip percentile"
+ Date: Tue Mar 24 17:59:42 2026 +0000
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+
+codex
+La base valida resta `2397c5b` con `1.29656339`. Per non bruciare altri run invalidi, prima verifico quando si libera la GPU; poi riparto con una modifica che non tocchi il budget tempo, probabilmente bias lineari o un’altra regolazione a costo-size minimo.
+exec
+/bin/bash -lc 'ps -o pid,etimes,cmd -p 146799' in /root/fmassapg exited 1 in 0ms:
+    PID ELAPSED CMD
+exec
+/bin/bash -lc 'nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader' in /root/fmassapg succeeded in 0ms:
+147687, python3, 56208 MiB
+exec
+/bin/bash -lc "grep -n \"train_optimized_gpt.py\" -R . | sed -n '1,40p'" in /root/fmassapgfile update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+
+ succeeded in 5.74s:
+./autoresearch/codex_mar24.log:1716: 146799     715 python3 train_optimized_gpt.py
+./autoresearch/codex_mar24.log:1816: 146799     729 python3 train_optimized_gpt.py
+./autoresearch/codex_mar24.log:1845:Questo timeout è chiaramente contaminato da contention sulla macchina: c’è un altro `train_optimized_gpt.py` attivo e il passo medio è degenerato durante il run. Registro comunque `9d098c5` come crash/timeout e revert del commit per non tenere un risultato invalido.
+exec
+/bin/bash -lc 'ps -o pid,etimes,cmd -p 147687' in /root/fmassapg succeeded in 0ms:
+    PID ELAPSED CMD
+ 147687     236 python3 train_optimized_gpt_final.py
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+
+Reconnecting... 2/5 (timeout waiting for child process to exit)
+codex
+La GPU è ancora occupata da un altro processo (`train_optimized_gpt_final.py`), quindi non lancio un nuovo run finché non si libera. Nel frattempo preparo la prossima idea a basso rischio: aggiungere bias ai layer lineari con init a zero sui rami `_zero_init`, costo-size di poche decine di KB.
+exec
+/bin/bash -lc 'sleep 120; nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader' in /root/fmassapgfile update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+
+ succeeded in 1m 59s:
+148133, python3, 45966 MiB
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+
+exec
+/bin/bash -lc 'nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader' in /root/fmassapg succeeded in 0ms:
+0, NVIDIA H100 80GB HBM3, 45975 MiB, 81559 MiB, 100 %
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+
+Plan update
+Ho eseguito baseline e due esperimenti atomici con registrazione/revert. Il loop ora è bloccato da un altro training attivo sull’unica GPU del server, che rende invalidi i nuovi run per timeout.
+  ✓ Ispezionare le sezioni rilevanti di train_gpt.py e definire il punto di partenza reale di HEAD
+  ✓ Eseguire e registrare il baseline del commit corrente
+  ✓ Scegliere il prossimo cambiamento singolo, committarlo ed eseguire un nuovo run
+  ✓ Tenere o revertire il commit in base a improvement e size, poi aggiornare results.tsv
+  • Ripetere il loop con la prossima idea finché c’è budget di turno
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+
+exec
+/bin/bash -lc 'git log --oneline -n 8' in /root/fmassapg succeeded in 0ms:
+b3d965e Revert "Lower int8 clip percentile"
+9d098c5 Lower int8 clip percentile
+e4c6e1c Revert "Enable EMA by default"
+3de950f Enable EMA by default
+44339ad Revert "Default to sliding eval stride 64"
+88ae44b Default to sliding eval stride 64
+2397c5b Add sliding eval and EMA options
+5c68904 add autoresearch zip
+exec
+/bin/bash -lc 'git status --short' in /root/fmassapg succeeded in 0ms:
+?? autoresearch/
+?? final_model.int8.ptz
+?? final_model.pt
+exec
+/bin/bash -lc "sed -n '1,20p' autoresearch/results.tsv" in /root/fmassapg succeeded in 0ms:
+commit	val_bpb	size_bytes	size_ok	status	param_changes	description
+2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
+88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
+3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
+9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+
+exec
+/bin/bash -lc 'nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader' in /root/fmassapg succeeded in 0ms:
+0, 45977 MiB, 100 %
+exec
+/bin/bash -lc 'nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader' in /root/fmassapg succeeded in 0ms:
+148133, python3, 45968 MiB
+exec
+/bin/bash -lc 'ps -o pid,etimes,cmd -p $(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits | head -1)' in /root/fmassapg succeeded in 0ms:
+    PID ELAPSED CMD
+ 148133     462 python3 train_optimized_gpt_final.py
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+
+codex
+Ho eseguito il loop finché i run restavano validi e ho aggiornato [results.tsv](/root/fmassapg/autoresearch/results.tsv). Stato attuale: miglior run valido resta `2397c5b` con `val_bpb=1.29656339` e `size=15056094`. Gli altri tentativi registrati sono:
+- `88ae44b`: `EVAL_STRIDE=64`, timeout oltre 15 min, revertito
+- `3de950f`: `EMA_ENABLED=1`, peggiora a `1.30088756`, revertito
+- `9d098c5`: `INT8_CLIP_PERCENTILE=99.999`, timeout sotto contention, revertito
+
+Il codice è tornato alla base valida tramite revert commit; la branch non ha una modifica sperimentale attiva. Al momento non ho lanciato altri run perché l’unica GPU del server è occupata da un processo esterno `python3 train_optimized_gpt_final.py` su GPU 0, circa `45.9 GiB`, `100%` utilization, e i nuovi esperimenti stanno sforando il limite operativo di 15 minuti. Quando la GPU si libera, la prossima prova sensata è una modifica a costo-bytes minimo, probabilmente bias lineari.
+file update:
+diff --git a/autoresearch/results.tsv b/autoresearch/results.tsv
+index a167fcb847ddf1b3468c910b47ad682875428824..4f8aa0bc9215e60a59e9f4180e700a0bdf23a271
+--- a/autoresearch/results.tsv
++++ b/autoresearch/results.tsv
+@@ -1 +1,5 @@
+ commit	val_bpb	size_bytes	size_ok	status	param_changes	description
++2397c5b	1.29656339	15056094	yes	keep	baseline	baseline HEAD run with standard eval, no EMA, default 2000-step runner
++88ae44b	0.00000000	0	n/a	crash	EVAL_STRIDE=64	sliding evaluation exceeded 15-minute total timeout before final metrics
++3de950f	1.30088756	14950024	yes	discard	EMA_ENABLED=1	enable EMA by default; worse post-quant bpb despite slightly smaller artifact
++9d098c5	0.00000000	0	n/a	crash	INT8_CLIP_PERCENTILE=99.999	run timed out under heavy machine contention before final metrics
+
+tokens used
+215,870
+Ho eseguito il loop finché i run restavano validi e ho aggiornato [results.tsv](/root/fmassapg/autoresearch/results.tsv). Stato attuale: miglior run valido resta `2397c5b` con `val_bpb=1.29656339` e `size=15056094`. Gli altri tentativi registrati sono:
+- `88ae44b`: `EVAL_STRIDE=64`, timeout oltre 15 min, revertito
+- `3de950f`: `EMA_ENABLED=1`, peggiora a `1.30088756`, revertito
+- `9d098c5`: `INT8_CLIP_PERCENTILE=99.999`, timeout sotto contention, revertito
+
+Il codice è tornato alla base valida tramite revert commit; la branch non ha una modifica sperimentale attiva. Al momento non ho lanciato altri run perché l’unica GPU del server è occupata da un processo esterno `python3 train_optimized_gpt_final.py` su GPU 0, circa `45.9 GiB`, `100%` utilization, e i nuovi esperimenti stanno sforando il limite operativo di 15 minuti. Quando la GPU si libera, la prossima prova sensata è una modifica a costo-bytes minimo, probabilmente bias lineari.
